@@ -31,7 +31,7 @@ class ADMSConfig:
     importance_ratio: float = 0.5  # fraction of budget reserved for exact top tokens
     min_importance_tokens: int = 4  # minimum number of exact tokens if ratio > 0
     importance_metric: str = "value_norm"  # scoring: value_norm, key_norm, mixed, attention
-    use_adaptive_budget: bool = True  # dynamically adjust budget per head
+    use_adaptive_budget: bool = False  # dynamically adjust budget per head (DISABLED by default - prevents cache explosion)
     attention_window: int = 128  # recent tokens to compute importance from
     attention_blend: float = 0.7  # mix attention sim with value norm when available
     importance_normalize: bool = True  # normalize scores to [0,1]
@@ -470,22 +470,29 @@ class ADMSKVCache:
                         truncated_past = []
                         for k, v in past_key_values:
                             # k, v shape: [batch, heads, seq, dim]
-                            keep_start = k[:, :, :self.start_size, :]
-                            keep_recent = k[:, :, -self.recent_size:, :]
+                            keep_start_k = k[:, :, :self.start_size, :]
+                            keep_start_v = v[:, :, :self.start_size, :]
+                            keep_recent_k = k[:, :, -self.recent_size:, :]
+                            keep_recent_v = v[:, :, -self.recent_size:, :]
                             # Sample middle evenly
                             middle_start = self.start_size
                             middle_end = k.shape[2] - self.recent_size
-                            middle_indices = torch.linspace(middle_start, middle_end-1, 
-                                                           min(self.compressed_budget, middle_end - middle_start),
-                                                           dtype=torch.long, device=k.device)
+                            middle_indices = torch.linspace(
+                                middle_start,
+                                middle_end - 1,
+                                min(self.compressed_budget, middle_end - middle_start),
+                                dtype=torch.long,
+                                device=k.device,
+                            )
                             keep_middle_k = k[:, :, middle_indices, :]
                             keep_middle_v = v[:, :, middle_indices, :]
-                            
-                            trunc_k = torch.cat([keep_start, keep_middle_k, keep_recent], dim=2)
-                            trunc_v = torch.cat([k[:, :, :self.start_size, :], keep_middle_v, keep_recent], dim=2)
+
+                            trunc_k = torch.cat([keep_start_k, keep_middle_k, keep_recent_k], dim=2)
+                            trunc_v = torch.cat([keep_start_v, keep_middle_v, keep_recent_v], dim=2)
                             truncated_past.append((trunc_k, trunc_v))
                         return truncated_past
                 return past_key_values
+            # If we reach here, compression should run - fall through to main loop below
         except Exception:
             # If unexpected structure, fall back to standard path
             pass
@@ -656,6 +663,47 @@ class ADMSKVCache:
             new_past_key_values.append((layer_k, layer_v))
         # Update last compressed length after successful compression
         self.last_compress_len = seq_len
+        
+        # CRITICAL: Enforce max cache size even after compression
+        # In case adaptive budgets or other logic caused cache to exceed limit
+        max_cache_size = self.start_size + self.compressed_budget + self.recent_size
+        actual_cache_size = new_past_key_values[0][0].shape[2]
+        
+        if actual_cache_size > max_cache_size:
+            print(f"[ADMS Post-compress @ {seq_len}] Cache {actual_cache_size} > {max_cache_size}, enforcing limit", flush=True)
+            # Truncate: keep start, sample middle to budget, keep recent
+            final_past = []
+            for k, v in new_past_key_values:
+                keep_start_k = k[:, :, :self.start_size, :]
+                keep_start_v = v[:, :, :self.start_size, :]
+                keep_recent_k = k[:, :, -self.recent_size:, :]
+                keep_recent_v = v[:, :, -self.recent_size:, :]
+                
+                middle_start = self.start_size
+                middle_end = k.shape[2] - self.recent_size
+                middle_size = middle_end - middle_start
+                
+                if middle_size > self.compressed_budget:
+                    # Sample middle evenly to fit budget
+                    middle_indices = torch.linspace(
+                        middle_start, middle_end - 1,
+                        self.compressed_budget,
+                        dtype=torch.long,
+                        device=k.device
+                    )
+                    keep_middle_k = k[:, :, middle_indices, :]
+                    keep_middle_v = v[:, :, middle_indices, :]
+                else:
+                    keep_middle_k = k[:, :, middle_start:middle_end, :]
+                    keep_middle_v = v[:, :, middle_start:middle_end, :]
+                
+                final_k = torch.cat([keep_start_k, keep_middle_k, keep_recent_k], dim=2)
+                final_v = torch.cat([keep_start_v, keep_middle_v, keep_recent_v], dim=2)
+                final_past.append((final_k, final_v))
+            
+            new_past_key_values = final_past
+            actual_cache_size = new_past_key_values[0][0].shape[2]
+            print(f"[ADMS Post-compress @ {seq_len}] Enforced to {actual_cache_size}", flush=True)
         
         # Print stats more frequently for debugging (every 512 tokens or at key milestones)
         log_interval = 512

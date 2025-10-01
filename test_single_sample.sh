@@ -28,6 +28,7 @@ python examples/eval_adms_vs_streaming.py \
   --importance_ratio 0.8 \
   --compression_interval 32 \
   --min_seq_len 512 \
+  --min_middle_size_for_compress 8 \
   --output_dir "outputs/diagnostic"
 
 echo ""
