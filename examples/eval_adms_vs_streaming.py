@@ -103,10 +103,15 @@ def evaluate_method(
     # Prepare one or many sequences depending on concat_stream
     sequences = []
     if concat_stream:
-        # Scan more items than num_samples to skip empty entries
+        # Keep concatenating until we reach num_eval_tokens (if specified) or exhaust dataset
+        # Note: num_samples parameter is IGNORED in concat_stream mode - we pull as many
+        # samples as needed to reach the token target
         max_items = min(len(dataset), concat_limit or len(dataset))
         texts = []
         empty_count = 0
+        target_tokens = num_eval_tokens if num_eval_tokens is not None else float('inf')
+        
+        # Accumulate texts until we have enough tokens
         for i in range(max_items):
             item = dataset[i]
             if text_field not in item:
@@ -116,8 +121,15 @@ def evaluate_method(
                 texts.append(t.strip())
             else:
                 empty_count += 1
-            if len(texts) >= num_samples:
-                break
+            
+            # Check periodically (every 10 samples) to avoid excessive tokenization overhead
+            if len(texts) > 0 and len(texts) % 10 == 0:
+                big_text = sep.join(texts)
+                enc = tokenizer(big_text, return_tensors="pt", add_special_tokens=False)
+                current_tokens = enc.input_ids.size(1)
+                if current_tokens >= target_tokens:
+                    print(f"{method_name}: Reached target of {target_tokens} tokens after {len(texts)} samples (actual: {current_tokens} tokens)")
+                    break
         
         print(f"{method_name}: Scanned {empty_count + len(texts)} items, found {len(texts)} non-empty (skipped {empty_count} empty)")
         
@@ -127,7 +139,8 @@ def evaluate_method(
         
         big_text = sep.join(texts)
         enc = tokenizer(big_text, return_tensors="pt")
-        print(f"{method_name}: Concatenated text has {enc.input_ids.size(1)} tokens")
+        actual_tokens = enc.input_ids.size(1)
+        print(f"{method_name}: Concatenated {len(texts)} samples into {actual_tokens} tokens (target was {num_eval_tokens or 'unlimited'})")
         sequences.append(enc.input_ids.to(device))
     else:
         # Iterate samples; skip empty or too-short items

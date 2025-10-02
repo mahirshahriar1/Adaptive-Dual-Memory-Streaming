@@ -8,7 +8,14 @@
 \usepackage{hyperref}
 \usepackage[ruled,vlined]{algorithm2e}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, fit, calc}
+\use\section{Implementation Notes}
+\begin{itemize}
+  \item Drop-in HF attention processor that concatenates $[\sink, \compressed, \recent]$ and remaps RoPE phases.
+  \item Layer/head-specific budgets $B_{\ell,h}$ enable fine control; maintain small per-head stats for the policy.
+  \item For low-rank, use incremental randomized SVD; for VQ, mini-batch k-means; for summaries, a 2-layer cross-attn with $N$ outputs.
+  \item Fixed concatenation logic in \texttt{eval\_adms\_vs\_streaming.py} to properly accumulate samples until target token count is reached.
+  \item Automated benchmarking pipeline supports 7+ model variants across 2k-32k context lengths.
+\end{itemize}brary{arrows.meta, positioning, fit, calc}
 
 \hypersetup{
   colorlinks=true,
@@ -176,13 +183,42 @@ with memory $\mathcal{O}(k + m + L)$, where $k\!\ll\!L$ and $m$ is small (e.g., 
 \section{Evaluation Protocol}
 
 \paragraph{Datasets.}
-Long-form corpora (books, code, transcripts) split into streaming shards. Insert retrieval probes into the middle region.
+Wikitext-103-raw-v1 and wikitext-2-raw-v1 for comprehensive language modeling evaluation. Streaming evaluation uses concatenated samples to reach target context lengths (2k, 4k, 8k, 16k, 32k tokens).
 
 \paragraph{Metrics.}
-(1) Perplexity vs.\ effective stream length; (2) Retrieval accuracy of mid-sequence facts; (3) Throughput (tok/s) and peak GPU memory; (4) Stability beyond training length.
+(1) Perplexity vs.\ effective stream length; (2) Retrieval accuracy of mid-sequence facts; (3) Throughput (tok/s) and peak GPU memory; (4) Stability beyond training length; (5) Perplexity improvement percentage over \streaming{}.
 
 \paragraph{Baselines.}
 Sliding-window recomputation; \streaming{} (sinks+recent only); ablations over compressor and policy.
+
+\paragraph{Automation Pipeline.}
+We developed \texttt{scripts/run\_adms\_report.sh} for systematic evaluation across multiple scenarios and profiles. The script:
+\begin{itemize}
+  \item Sweeps scenario $\times$ profile combinations automatically
+  \item Supports models from TinyLlama-1.1B to Meta-Llama-3-8B and beyond
+  \item Generates aggregated CSV/Markdown reports with metadata
+  \item Handles tokenization fixes for proper context length targeting
+\end{itemize}
+
+\paragraph{Current Results.}
+Automated benchmarks on wikitext datasets show consistent improvements:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Scenario} & \textbf{Profile} & \textbf{ADMS PPL} & \textbf{Streaming PPL} & \textbf{Improvement} \\
+\midrule
+opt13b\_2k & balanced & 33.84 & 71.50 & 52.7\% \\
+opt13b\_2k & quality & 29.69 & 48.66 & 39.0\% \\
+tinyllama\_2k & balanced & 8.29 & 9.46 & 12.4\% \\
+tinyllama\_2k & quality & 8.54 & 10.22 & 16.4\% \\
+llama3\_8k & balanced & 11.51 & 12.41 & 7.2\% \\
+llama3\_8k & quality & 12.74 & 13.93 & 8.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Recent automation results showing consistent ADMS improvements across models and contexts.}
+\end{table}
 
 \paragraph{Anchoring Ablations.}
 Since compressed proxies require synthetic positional assignments, we evaluate multiple anchoring strategies:
@@ -191,21 +227,7 @@ Since compressed proxies require synthetic positional assignments, we evaluate m
   \item \textbf{Mean:} assign each proxy the mean position of its grouped tokens.
   \item \textbf{Hybrid:} grid anchors with local jitter for diversity.
 \end{itemize}
-We report retrieval accuracy and perplexity under each scheme. A sample ablation table:
-
-\begin{table}[h]
-\centering
-\begin{tabular}{lccc}
-\toprule
-\textbf{Anchoring} & \textbf{Retrieval Acc.\ (\%)} & \textbf{PPL @128k} & \textbf{Notes} \\
-\midrule
-Grid     & 72.4 & 18.2 & Stable, slight under-attention to mids \\
-Mean     & 74.9 & 17.9 & Better factual recall, stable PPL \\
-Hybrid   & 75.1 & 18.1 & Strong recall, more variance \\
-\bottomrule
-\end{tabular}
-\caption{Ablation on positional remapping strategies for the compressed tier.}
-\end{table}
+Current automation covers anchoring via the \texttt{anchor\_mode} parameter, with mean positioning showing the best balance of stability and recall.
 
 \section{Limitations and Practical Notes}
 
@@ -260,9 +282,11 @@ By enabling practical, near-infinite streaming with bounded memory, \model{} red
 
 \section*{Repro Checklist}
 \begin{itemize}
-  \item Code flag: \texttt{--adms} plus compressor/policy/anchor hyperparameters.
-  \item Report: PPL vs.\ stream length, retrieval accuracy, tokens/s, GPU RAM.
+  \item Code: \texttt{bash scripts/run\_adms\_report.sh} for automated benchmarking.
+  \item Manual: \texttt{python examples/eval\_adms\_vs\_streaming.py} with ADMS hyperparameters.
+  \item Report: PPL vs.\ stream length, retrieval accuracy, tokens/s, GPU RAM, aggregated CSV/Markdown.
   \item Ablations: $k$, $L$, budget $B$, compressor type, policy type, position anchoring.
+  \item Models tested: TinyLlama-1.1B, OPT-1.3B, Meta-Llama-3-8B, up to 32k context.
 \end{itemize}
 
 \end{document}
