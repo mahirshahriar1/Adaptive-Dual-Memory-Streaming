@@ -220,6 +220,8 @@ def parse_args():
     p.add_argument("--rank", type=int, default=16, help="Low-rank rank")
     p.add_argument("--num_clusters", type=int, default=64, help="VQ clusters")
     p.add_argument("--anchor_mode", type=str, default="mean", choices=["mean", "grid", "hybrid"], help="Anchor positions for compressed tokens")
+    p.add_argument("--max_seq_length", type=int, default=32768, help="Maximum expected sequence length for dynamic sink sizing")
+    p.add_argument("--enable_dynamic_sink", action="store_true", help="Enable dynamic sink size scaling (1%% of max_seq_length)")
     p.add_argument("--compression_interval", type=int, default=8)
     p.add_argument("--svd_max_tokens", type=int, default=512)
     p.add_argument("--min_middle_size_for_compress", type=int, default=64)
@@ -274,6 +276,8 @@ def main():
         rank=args.rank,
         num_clusters=args.num_clusters,
         enable_pos_shift=False,  # already applied above if requested
+        max_seq_length=args.max_seq_length,
+        enable_dynamic_sink=args.enable_dynamic_sink,
         compression_interval=args.compression_interval,
         svd_max_tokens=args.svd_max_tokens,
         min_middle_size_for_compress=args.min_middle_size_for_compress,

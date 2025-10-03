@@ -38,18 +38,33 @@ mkdir -p "${OUTPUT_ROOT}"
 # NOTE: Long-context (≥8k) scenarios below assume you have enough VRAM
 # and have accepted any gated model licenses on Hugging Face.
 PROFILES=(
-    "name=balanced start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1"
-    "name=quality start=4 recent=128 budget=128 ratio=0.75 interval=64 rank=8 svd=256 pos_shift=1"
+    "name=balanced start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1"
+    "name=quality start=4 recent=128 budget=128 ratio=0.75 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1"
 )
 
 SCENARIOS=(
-    "name=tinyllama_2k model=TinyLlama/TinyLlama-1.1B-Chat-v1.0 dataset=wikitext task=wikitext-103-raw-v1 split=test samples=128 tokens=2048"
-    "name=tinyllama_4k model=TinyLlama/TinyLlama-1.1B-Chat-v1.0 dataset=wikitext task=wikitext-103-raw-v1 split=test samples=96 tokens=4096 log_every=256"
-    "name=opt13b_2k model=facebook/opt-1.3b dataset=wikitext task=wikitext-2-raw-v1 split=test samples=128 tokens=2048"
-    "name=opt13b_4k model=facebook/opt-1.3b dataset=wikitext task=wikitext-2-raw-v1 split=test samples=96 tokens=4096 log_every=256"
-    "name=llama3_8k model=meta-llama/Meta-Llama-3-8B-Instruct dataset=wikitext task=wikitext-103-raw-v1 split=test samples=64 tokens=8192 log_every=512"
-    "name=llama3_16k model=meta-llama/Meta-Llama-3-8B-Instruct dataset=wikitext task=wikitext-103-raw-v1 split=test samples=48 tokens=16384 log_every=1024"
-    "name=llama3_32k model=meta-llama/Meta-Llama-3-8B-Instruct dataset=wikitext task=wikitext-103-raw-v1 split=test samples=32 tokens=32768 log_every=2048"
+    # Small models (1-2B) - Fast experiments
+    "name=tinyllama_2k model=TinyLlama/TinyLlama-1.1B-Chat-v1.0 dataset=wikitext task=wikitext-103-raw-v1 split=test samples=128 tokens=2048 max_len=2048"
+    "name=tinyllama_4k model=TinyLlama/TinyLlama-1.1B-Chat-v1.0 dataset=wikitext task=wikitext-103-raw-v1 split=test samples=96 tokens=4096 log_every=256 max_len=4096"
+    "name=opt13b_2k model=facebook/opt-1.3b dataset=wikitext task=wikitext-2-raw-v1 split=test samples=128 tokens=2048 max_len=2048"
+    "name=opt13b_4k model=facebook/opt-1.3b dataset=wikitext task=wikitext-2-raw-v1 split=test samples=96 tokens=4096 log_every=256 max_len=4096"
+    
+    # Medium models (7B) from StreamingLLM paper
+    "name=pythia69b_4k model=EleutherAI/pythia-6.9b dataset=wikitext task=wikitext-103-raw-v1 split=test samples=96 tokens=4096 log_every=256 max_len=4096"
+    "name=pythia69b_8k model=EleutherAI/pythia-6.9b dataset=wikitext task=wikitext-103-raw-v1 split=test samples=64 tokens=8192 log_every=512 max_len=8192"
+    "name=falcon7b_4k model=tiiuae/falcon-7b dataset=wikitext task=wikitext-103-raw-v1 split=test samples=96 tokens=4096 log_every=256 max_len=4096"
+    "name=falcon7b_8k model=tiiuae/falcon-7b dataset=wikitext task=wikitext-103-raw-v1 split=test samples=64 tokens=8192 log_every=512 max_len=8192"
+    "name=mpt7b_4k model=mosaicml/mpt-7b dataset=wikitext task=wikitext-103-raw-v1 split=test samples=96 tokens=4096 log_every=256 max_len=4096"
+    "name=mpt7b_8k model=mosaicml/mpt-7b dataset=wikitext task=wikitext-103-raw-v1 split=test samples=64 tokens=8192 log_every=512 max_len=8192"
+    
+    # Large models (8B) - Long context
+    "name=llama3_8k model=meta-llama/Meta-Llama-3-8B-Instruct dataset=wikitext task=wikitext-103-raw-v1 split=test samples=64 tokens=8192 log_every=512 max_len=8192"
+    "name=llama3_16k model=meta-llama/Meta-Llama-3-8B-Instruct dataset=wikitext task=wikitext-103-raw-v1 split=test samples=48 tokens=16384 log_every=1024 max_len=16384"
+    "name=llama3_32k model=meta-llama/Meta-Llama-3-8B-Instruct dataset=wikitext task=wikitext-103-raw-v1 split=test samples=32 tokens=32768 log_every=2048 max_len=32768"
+    
+    # Modern alternatives (optional - comment out if too slow)
+    # "name=mistral7b_16k model=mistralai/Mistral-7B-v0.1 dataset=wikitext task=wikitext-103-raw-v1 split=test samples=48 tokens=16384 log_every=1024 max_len=16384"
+    # "name=mistral7b_32k model=mistralai/Mistral-7B-v0.1 dataset=wikitext task=wikitext-103-raw-v1 split=test samples=32 tokens=32768 log_every=2048 max_len=32768"
 )
 
 
@@ -83,6 +98,9 @@ run_combination() {
     local num_eval_tokens=${scenario[tokens]:-${NUM_EVAL_TOKENS}}
     local log_every_value=${scenario[log_every]:-${LOG_EVERY}}
     local min_seq_len_value=${scenario[min_seq_len]:-${MIN_SEQ_LEN}}
+    local max_seq_length=${scenario[max_len]:-${num_eval_tokens}}
+    local recent_size=${scenario[recent]:-${cfg[recent]}}
+    local compressed_budget=${scenario[budget]:-${cfg[budget]}}
 
     local out_dir="${OUTPUT_ROOT}/${scenario_name}/${profile_name}"
     mkdir -p "${out_dir}"
@@ -97,10 +115,16 @@ run_combination() {
     fi
 
     echo "\n=== Running scenario: ${scenario_name} | profile: ${profile_name} ==="
+    echo "    Recent size: ${recent_size}, Compressed budget: ${compressed_budget}"
 
     local num_eval_tokens_args=()
     if [[ -n "${num_eval_tokens}" && "${num_eval_tokens}" != "none" ]]; then
         num_eval_tokens_args=(--num_eval_tokens "${num_eval_tokens}")
+    fi
+
+    local dynamic_sink_flag=""
+    if [[ "${cfg[dynamic_sink]:-0}" == "1" ]]; then
+        dynamic_sink_flag="--enable_dynamic_sink"
     fi
 
     python examples/eval_adms_vs_streaming.py \
@@ -111,13 +135,15 @@ run_combination() {
         --num_samples "${num_samples}" \
         "${num_eval_tokens_args[@]}" \
         --start_size "${cfg[start]}" \
-        --recent_size "${cfg[recent]}" \
-        --compressed_budget "${cfg[budget]}" \
+        --recent_size "${recent_size}" \
+        --compressed_budget "${compressed_budget}" \
         --importance_ratio "${cfg[ratio]}" \
         --compression_interval "${cfg[interval]}" \
         --min_middle_size_for_compress 64 \
         --rank "${cfg[rank]}" \
         --svd_max_tokens "${cfg[svd]}" \
+        --max_seq_length "${max_seq_length}" \
+        ${dynamic_sink_flag} \
         --log_every "${log_every_value}" \
         --min_seq_len "${min_seq_len_value}" \
         --output_dir "${out_dir}" \

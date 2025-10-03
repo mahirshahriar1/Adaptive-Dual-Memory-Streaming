@@ -13,7 +13,7 @@ from dataclasses import dataclass
 @dataclass
 class ADMSConfig:
     """Configuration for ADMS KV Cache"""
-    start_size: int = 4  # sink tokens
+    start_size: int = 4  # sink tokens (base/minimum)
     recent_size: int = 2000  # recent window
     compressed_budget: int = 128  # max compressed tokens
     compressor_type: str = "low_rank"  # "low_rank", "vq", "summary"
@@ -23,6 +23,8 @@ class ADMSConfig:
     rank: int = 16  # for low-rank compression
     num_clusters: int = 64  # for VQ compression
     compression_ratio: float = 0.25  # compression ratio (0.25 = 4:1)
+    max_seq_length: int = 32768  # maximum expected sequence length
+    enable_dynamic_sink: bool = True  # scale sink size with context length
     # Performance knobs
     compression_interval: int = 8  # only run compression every N new tokens
     compression_middle_threshold: int = 256  # force compression once middle exceeds this many tokens
@@ -191,6 +193,17 @@ class ADMSKVCache:
         self.k_seq_dim = config.k_seq_dim
         self.v_seq_dim = config.v_seq_dim
         
+        # Dynamic sink sizing based on context length
+        if config.enable_dynamic_sink:
+            # Scale sink size: 1% of max context length (min: start_size)
+            # For 2K: ~20 tokens, For 8K: ~80 tokens, For 32K: ~320 tokens
+            self.dynamic_start_size = max(
+                self.start_size,
+                int(0.01 * config.max_seq_length)
+            )
+        else:
+            self.dynamic_start_size = self.start_size
+        
         # Initialize compressors
         self.compressors = {}
         self.policies = {}
@@ -212,13 +225,16 @@ class ADMSKVCache:
         print(f"\n{'='*60}")
         print(f"ADMS CACHE INITIALIZED")
         print(f"{'='*60}")
-        print(f"  Start tokens:      {self.start_size}")
+        print(f"  Static sink size:  {self.start_size}")
+        if config.enable_dynamic_sink:
+            print(f"  Dynamic sink size: {self.dynamic_start_size} (scaled for {config.max_seq_length} context)")
         print(f"  Recent window:     {self.recent_size}")
         print(f"  Compressed budget: {self.compressed_budget}")
         print(f"  Compressor type:   {config.compressor_type}")
         print(f"  Importance ratio:  {config.importance_ratio}")
         print(f"  Compression interval: {config.compression_interval}")
-        print(f"  Expected max cache size: {self.start_size + self.compressed_budget + self.recent_size}")
+        effective_sink = self.dynamic_start_size if config.enable_dynamic_sink else self.start_size
+        print(f"  Expected max cache size: {effective_sink + self.compressed_budget + self.recent_size}")
         print(f"{'='*60}\n", flush=True)
         
     def _get_compressor(self, layer: int, head: int):
@@ -450,9 +466,10 @@ class ADMSKVCache:
             first_k = past_key_values[0][0]
             # Expect [batch, heads, seq_len, dim]
             seq_len = first_k.shape[2]
-            if seq_len <= (self.start_size + self.recent_size):
+            effective_sink = self.dynamic_start_size if self.config.enable_dynamic_sink else self.start_size
+            if seq_len <= (effective_sink + self.recent_size):
                 return past_key_values
-            middle_len = seq_len - (self.start_size + self.recent_size)
+            middle_len = seq_len - (effective_sink + self.recent_size)
             if middle_len <= 0:
                 return past_key_values
             interval = max(1, self.config.compression_interval)
@@ -462,20 +479,20 @@ class ADMSKVCache:
             if (seq_len - self.last_compress_len) < interval and not debt_triggered:
                 # IMPORTANT: Still need to enforce budget even when skipping compression
                 # Otherwise cache grows unbounded between compression steps
-                if seq_len > (self.start_size + self.recent_size) and self.compressed_budget > 0:
+                if seq_len > (effective_sink + self.recent_size) and self.compressed_budget > 0:
                     # Quick eviction: keep start + budget + recent
-                    max_cache_size = self.start_size + self.compressed_budget + self.recent_size
+                    max_cache_size = effective_sink + self.compressed_budget + self.recent_size
                     if first_k.shape[2] > max_cache_size:
-                        # Simple truncation: keep first start_size, drop middle to budget, keep last recent_size
+                        # Simple truncation: keep first effective_sink, drop middle to budget, keep last recent_size
                         truncated_past = []
                         for k, v in past_key_values:
                             # k, v shape: [batch, heads, seq, dim]
-                            keep_start_k = k[:, :, :self.start_size, :]
-                            keep_start_v = v[:, :, :self.start_size, :]
+                            keep_start_k = k[:, :, :effective_sink, :]
+                            keep_start_v = v[:, :, :effective_sink, :]
                             keep_recent_k = k[:, :, -self.recent_size:, :]
                             keep_recent_v = v[:, :, -self.recent_size:, :]
                             # Sample middle evenly
-                            middle_start = self.start_size
+                            middle_start = effective_sink
                             middle_end = k.shape[2] - self.recent_size
                             middle_indices = torch.linspace(
                                 middle_start,
@@ -506,7 +523,10 @@ class ADMSKVCache:
             # Update current length
             self.current_length = seq_len
             
-            if seq_len <= self.start_size + self.recent_size:
+            # Use dynamic sink size for this layer
+            effective_sink = self.dynamic_start_size if self.config.enable_dynamic_sink else self.start_size
+            
+            if seq_len <= effective_sink + self.recent_size:
                 # No compression needed yet (should have been caught by fast path)
                 new_past_key_values.append((key_states, value_states))
                 continue
@@ -520,16 +540,16 @@ class ADMSKVCache:
                 v = value_states[0, head_idx]  # [seq_len, d_v]
                 
                 # Split into three tiers
-                sink_k = k[:self.start_size]  # [start_size, d_k]
-                sink_v = v[:self.start_size]  # [start_size, d_v]
+                sink_k = k[:effective_sink]  # [effective_sink, d_k]
+                sink_v = v[:effective_sink]  # [effective_sink, d_v]
                 
                 recent_start = seq_len - self.recent_size
                 recent_k = k[recent_start:]  # [recent_size, d_k]
                 recent_v = v[recent_start:]  # [recent_size, d_v]
                 
                 # Middle region for compression
-                middle_k = k[self.start_size:recent_start]  # [middle_len, d_k]
-                middle_v = v[self.start_size:recent_start]  # [middle_len, d_v]
+                middle_k = k[effective_sink:recent_start]  # [middle_len, d_k]
+                middle_v = v[effective_sink:recent_start]  # [middle_len, d_v]
 
                 # Default: drop middle entirely (like StreamingLLM)
                 middle_combined_k = middle_k[:0]  # Empty tensor
@@ -537,7 +557,7 @@ class ADMSKVCache:
 
                 if middle_k.shape[0] >= self.config.min_middle_size_for_compress and self.compressed_budget > 0:
                     middle_positions = torch.arange(
-                        self.start_size,
+                        effective_sink,
                         recent_start,
                         device=middle_k.device,
                         dtype=torch.long,
@@ -666,7 +686,8 @@ class ADMSKVCache:
         
         # CRITICAL: Enforce max cache size even after compression
         # In case adaptive budgets or other logic caused cache to exceed limit
-        max_cache_size = self.start_size + self.compressed_budget + self.recent_size
+        effective_sink = self.dynamic_start_size if self.config.enable_dynamic_sink else self.start_size
+        max_cache_size = effective_sink + self.compressed_budget + self.recent_size
         actual_cache_size = new_past_key_values[0][0].shape[2]
         
         if actual_cache_size > max_cache_size:
@@ -674,12 +695,12 @@ class ADMSKVCache:
             # Truncate: keep start, sample middle to budget, keep recent
             final_past = []
             for k, v in new_past_key_values:
-                keep_start_k = k[:, :, :self.start_size, :]
-                keep_start_v = v[:, :, :self.start_size, :]
+                keep_start_k = k[:, :, :effective_sink, :]
+                keep_start_v = v[:, :, :effective_sink, :]
                 keep_recent_k = k[:, :, -self.recent_size:, :]
                 keep_recent_v = v[:, :, -self.recent_size:, :]
                 
-                middle_start = self.start_size
+                middle_start = effective_sink
                 middle_end = k.shape[2] - self.recent_size
                 middle_size = middle_end - middle_start
                 
@@ -714,7 +735,8 @@ class ADMSKVCache:
             
             # Calculate actual cache size
             actual_cache_size = new_past_key_values[0][0].shape[2]  # [batch, heads, seq, dim]
-            expected_max = self.start_size + self.compressed_budget + self.recent_size
+            effective_sink = self.dynamic_start_size if self.config.enable_dynamic_sink else self.start_size
+            expected_max = effective_sink + self.compressed_budget + self.recent_size
             
             print(f"[ADMS Stats @ {seq_len}] Avg per head: exact={avg_exact:.1f}, compressed={avg_comp:.1f}, dropped={avg_dropped:.1f}", flush=True)
             print(f"[ADMS Cache @ {seq_len}] Actual size: {actual_cache_size}, Expected max: {expected_max}, Ratio: {actual_cache_size/seq_len:.2%}", flush=True)

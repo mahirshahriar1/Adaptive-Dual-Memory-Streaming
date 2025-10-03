@@ -21,6 +21,8 @@ def enable_adms_llm(
     rank=16,
     num_clusters=64,
     enable_pos_shift=True,
+    max_seq_length=32768,
+    enable_dynamic_sink=True,
     # Performance knobs
     compression_interval: int = 8,
     svd_max_tokens: int = 512,
@@ -44,7 +46,7 @@ def enable_adms_llm(
     
     Args:
         model: The transformer model to enable ADMS for
-        start_size: Number of sink tokens to keep (default: 4)
+        start_size: Number of sink tokens to keep (default: 4, base/minimum)
         recent_size: Size of recent window (default: 2000)  
         compressed_budget: Maximum compressed tokens per layer/head (default: 128)
         compressor_type: Type of compressor - "low_rank" or "vq" (default: "low_rank")
@@ -54,6 +56,8 @@ def enable_adms_llm(
         rank: Rank for low-rank compression (default: 16)
         num_clusters: Number of clusters for VQ compression (default: 64)
         enable_pos_shift: Whether to enable positional shifting (default: True)
+        max_seq_length: Maximum expected sequence length for dynamic sink sizing (default: 32768)
+        enable_dynamic_sink: Scale sink size proportionally with max_seq_length (default: True)
         importance_ratio: Fraction of compressed budget reserved for exact top tokens (default: 0.5)
         min_importance_tokens: Minimum number of exact tokens if ratio > 0 (default: 4)
         importance_metric: Scoring metric for importance-aware selection (default: "value_norm")
@@ -113,6 +117,8 @@ def enable_adms_llm(
         v_seq_dim=v_seq_dim,
         rank=rank,
         num_clusters=num_clusters,
+        max_seq_length=max_seq_length,
+        enable_dynamic_sink=enable_dynamic_sink,
         compression_interval=compression_interval,
         svd_max_tokens=svd_max_tokens,
         min_middle_size_for_compress=min_middle_size_for_compress,
@@ -135,7 +141,10 @@ def enable_adms_llm(
     adms_cache = ADMSKVCache(config)
     
     print(f"ADMS enabled for {model_type} model:")
-    print(f"  - Sink tokens: {start_size}")
+    print(f"  - Sink tokens (base): {start_size}")
+    if enable_dynamic_sink:
+        dynamic_size = max(start_size, int(0.01 * max_seq_length))
+        print(f"  - Sink tokens (dynamic): {dynamic_size} (for {max_seq_length} context)")
     print(f"  - Recent window: {recent_size}")
     print(f"  - Compressed budget: {compressed_budget}")
     print(f"  - Compressor: {compressor_type}")
