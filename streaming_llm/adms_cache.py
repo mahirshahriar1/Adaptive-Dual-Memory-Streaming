@@ -42,6 +42,20 @@ class ADMSConfig:
     adaptive_variance_smoothing: float = 0.1
     coverage_segments: int = 4  # split middle into segments for coverage-aware allocation
     coverage_priority: float = 0.3  # fraction of budget reserved for broad coverage
+    enable_dual_fidelity: bool = False
+    sketch_budget: int = 0
+    sketch_reduction: str = "mean"
+    enable_residual_replay: bool = False
+    replay_budget: int = 0
+    energy_replay_threshold: float = 0.9
+    enable_position_calibration: bool = False
+    calibration_window: int = 512
+    calibration_regularization: float = 0.1
+    enable_adaptive_controller: bool = False
+    controller_gain: float = 0.3
+    controller_energy_floor: float = 0.8
+    controller_energy_ceiling: float = 0.97
+    controller_group_size: int = 1
 
 
 class LowRankCompressor(nn.Module):
@@ -219,7 +233,16 @@ class ADMSKVCache:
             "total_exact_kept": 0,
             "total_compressed_kept": 0,
             "total_middle_dropped": 0,
+            "total_sketch_tokens": 0,
+            "total_replay_tokens": 0,
         }
+
+        self.middle_allocation = self.compressed_budget
+        if getattr(self.config, "enable_dual_fidelity", False):
+            self.middle_allocation += int(getattr(self.config, "sketch_budget", 0))
+        if getattr(self.config, "enable_residual_replay", False):
+            self.middle_allocation += int(getattr(self.config, "replay_budget", 0))
+        self.middle_allocation = max(0, int(self.middle_allocation))
         
         # Print config with flush to ensure it appears immediately
         print(f"\n{'='*60}")
@@ -234,7 +257,7 @@ class ADMSKVCache:
         print(f"  Importance ratio:  {config.importance_ratio}")
         print(f"  Compression interval: {config.compression_interval}")
         effective_sink = self.dynamic_start_size if config.enable_dynamic_sink else self.start_size
-        print(f"  Expected max cache size: {effective_sink + self.compressed_budget + self.recent_size}")
+        print(f"  Expected max cache size: {effective_sink + self.middle_allocation + self.recent_size}")
         print(f"{'='*60}\n", flush=True)
         
     def _get_compressor(self, layer: int, head: int):
@@ -447,6 +470,59 @@ class ADMSKVCache:
             raise ValueError(f"Unknown anchor mode: {self.config.anchor_mode}")
             
         return positions
+
+    def _coerce_head_sequence_length(
+        self,
+        key_seq: torch.Tensor,
+        value_seq: torch.Tensor,
+        effective_sink: int,
+        target_length: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Trim or subsample middle tokens so a head sequence matches the target length."""
+
+        seq_len = key_seq.shape[0]
+        if seq_len <= target_length:
+            return key_seq, value_seq, 0
+
+        recent_len = min(self.recent_size, max(0, seq_len - effective_sink))
+        target_middle = max(0, target_length - (effective_sink + recent_len))
+
+        middle_start = effective_sink
+        middle_end = seq_len - recent_len
+
+        if target_middle <= 0 or middle_end <= middle_start:
+            trimmed_keys = torch.cat([key_seq[:effective_sink], key_seq[-recent_len:]], dim=0)
+            trimmed_values = torch.cat([value_seq[:effective_sink], value_seq[-recent_len:]], dim=0)
+        else:
+            middle_indices = torch.linspace(
+                float(middle_start),
+                float(max(middle_start, middle_end - 1)),
+                steps=target_middle,
+                device=key_seq.device,
+                dtype=torch.float64,
+            ).round().long()
+            middle_indices = torch.clamp(middle_indices, middle_start, max(middle_start, middle_end - 1))
+            if middle_indices.numel() < target_middle:
+                pad_needed = target_middle - middle_indices.numel()
+                pad_idx = middle_indices[-1:].repeat(pad_needed) if middle_indices.numel() > 0 else torch.full(
+                    (pad_needed,), middle_start, dtype=torch.long, device=key_seq.device
+                )
+                middle_indices = torch.cat([middle_indices, pad_idx])
+            elif middle_indices.numel() > target_middle:
+                middle_indices = middle_indices[:target_middle]
+
+            middle_keys = key_seq[middle_indices]
+            middle_values = value_seq[middle_indices]
+
+            trimmed_keys = torch.cat([key_seq[:effective_sink], middle_keys, key_seq[-recent_len:]], dim=0)
+            trimmed_values = torch.cat([value_seq[:effective_sink], middle_values, value_seq[-recent_len:]], dim=0)
+
+        if trimmed_keys.shape[0] > target_length:
+            trimmed_keys = trimmed_keys[:target_length]
+            trimmed_values = trimmed_values[:target_length]
+
+        dropped = seq_len - trimmed_keys.shape[0]
+        return trimmed_keys, trimmed_values, max(0, dropped)
         
     def __call__(self, past_key_values):
         """
@@ -479,9 +555,9 @@ class ADMSKVCache:
             if (seq_len - self.last_compress_len) < interval and not debt_triggered:
                 # IMPORTANT: Still need to enforce budget even when skipping compression
                 # Otherwise cache grows unbounded between compression steps
-                if seq_len > (effective_sink + self.recent_size) and self.compressed_budget > 0:
+                if seq_len > (effective_sink + self.recent_size) and self.middle_allocation > 0:
                     # Quick eviction: keep start + budget + recent
-                    max_cache_size = effective_sink + self.compressed_budget + self.recent_size
+                    max_cache_size = effective_sink + self.middle_allocation + self.recent_size
                     if first_k.shape[2] > max_cache_size:
                         # Simple truncation: keep first effective_sink, drop middle to budget, keep last recent_size
                         truncated_past = []
@@ -494,15 +570,20 @@ class ADMSKVCache:
                             # Sample middle evenly
                             middle_start = effective_sink
                             middle_end = k.shape[2] - self.recent_size
-                            middle_indices = torch.linspace(
-                                middle_start,
-                                middle_end - 1,
-                                min(self.compressed_budget, middle_end - middle_start),
-                                dtype=torch.long,
-                                device=k.device,
-                            )
-                            keep_middle_k = k[:, :, middle_indices, :]
-                            keep_middle_v = v[:, :, middle_indices, :]
+                            mid_steps = min(self.middle_allocation, max(0, middle_end - middle_start))
+                            if mid_steps > 0:
+                                middle_indices = torch.linspace(
+                                    middle_start,
+                                    middle_end - 1,
+                                    mid_steps,
+                                    dtype=torch.long,
+                                    device=k.device,
+                                )
+                                keep_middle_k = k[:, :, middle_indices, :]
+                                keep_middle_v = v[:, :, middle_indices, :]
+                            else:
+                                keep_middle_k = k[:, :, middle_start:middle_start, :]
+                                keep_middle_v = v[:, :, middle_start:middle_start, :]
 
                             trunc_k = torch.cat([keep_start_k, keep_middle_k, keep_recent_k], dim=2)
                             trunc_v = torch.cat([keep_start_v, keep_middle_v, keep_recent_v], dim=2)
@@ -555,7 +636,7 @@ class ADMSKVCache:
                 middle_combined_k = middle_k[:0]  # Empty tensor
                 middle_combined_v = middle_v[:0]  # Empty tensor
 
-                if middle_k.shape[0] >= self.config.min_middle_size_for_compress and self.compressed_budget > 0:
+                if middle_k.shape[0] >= self.config.min_middle_size_for_compress and self.middle_allocation > 0:
                     middle_positions = torch.arange(
                         effective_sink,
                         recent_start,
@@ -674,6 +755,32 @@ class ADMSKVCache:
                 new_key_states.append(k_out)
                 new_value_states.append(v_out)
             
+            if new_key_states:
+                seq_lengths = [key.shape[0] for key in new_key_states]
+                target_len = min(seq_lengths)
+                max_allowed = effective_sink + self.middle_allocation + self.recent_size
+                target_len = min(target_len, max_allowed)
+
+                min_required = effective_sink + min(
+                    self.recent_size,
+                    target_len - effective_sink if target_len > effective_sink else 0,
+                )
+                target_len = max(target_len, min_required)
+
+                if any(length != target_len for length in seq_lengths):
+                    for idx, (head_k, head_v) in enumerate(zip(new_key_states, new_value_states)):
+                        if head_k.shape[0] != target_len:
+                            trimmed_k, trimmed_v, dropped = self._coerce_head_sequence_length(
+                                head_k,
+                                head_v,
+                                effective_sink,
+                                target_len,
+                            )
+                            new_key_states[idx] = trimmed_k
+                            new_value_states[idx] = trimmed_v
+                            if dropped > 0:
+                                self.stats["total_middle_dropped"] += dropped
+
             # Stack heads back together with correct dimension order:
             # new_key_states/new_value_states are lists of [new_seq, d_k] per head.
             # We need [batch=1, heads, seq, head_dim]. Stack along dim=0 to make [heads, seq, dim].
@@ -687,7 +794,7 @@ class ADMSKVCache:
         # CRITICAL: Enforce max cache size even after compression
         # In case adaptive budgets or other logic caused cache to exceed limit
         effective_sink = self.dynamic_start_size if self.config.enable_dynamic_sink else self.start_size
-        max_cache_size = effective_sink + self.compressed_budget + self.recent_size
+        max_cache_size = effective_sink + self.middle_allocation + self.recent_size
         actual_cache_size = new_past_key_values[0][0].shape[2]
         
         if actual_cache_size > max_cache_size:
@@ -704,16 +811,21 @@ class ADMSKVCache:
                 middle_end = k.shape[2] - self.recent_size
                 middle_size = middle_end - middle_start
                 
-                if middle_size > self.compressed_budget:
+                if middle_size > self.middle_allocation:
                     # Sample middle evenly to fit budget
-                    middle_indices = torch.linspace(
-                        middle_start, middle_end - 1,
-                        self.compressed_budget,
-                        dtype=torch.long,
-                        device=k.device
-                    )
-                    keep_middle_k = k[:, :, middle_indices, :]
-                    keep_middle_v = v[:, :, middle_indices, :]
+                    steps = min(self.middle_allocation, middle_size)
+                    if steps > 0:
+                        middle_indices = torch.linspace(
+                            middle_start, middle_end - 1,
+                            steps,
+                            dtype=torch.long,
+                            device=k.device
+                        )
+                        keep_middle_k = k[:, :, middle_indices, :]
+                        keep_middle_v = v[:, :, middle_indices, :]
+                    else:
+                        keep_middle_k = k[:, :, middle_start:middle_start, :]
+                        keep_middle_v = v[:, :, middle_start:middle_start, :]
                 else:
                     keep_middle_k = k[:, :, middle_start:middle_end, :]
                     keep_middle_v = v[:, :, middle_start:middle_end, :]
@@ -736,7 +848,7 @@ class ADMSKVCache:
             # Calculate actual cache size
             actual_cache_size = new_past_key_values[0][0].shape[2]  # [batch, heads, seq, dim]
             effective_sink = self.dynamic_start_size if self.config.enable_dynamic_sink else self.start_size
-            expected_max = effective_sink + self.compressed_budget + self.recent_size
+            expected_max = effective_sink + self.middle_allocation + self.recent_size
             
             print(f"[ADMS Stats @ {seq_len}] Avg per head: exact={avg_exact:.1f}, compressed={avg_comp:.1f}, dropped={avg_dropped:.1f}", flush=True)
             print(f"[ADMS Cache @ {seq_len}] Actual size: {actual_cache_size}, Expected max: {expected_max}, Ratio: {actual_cache_size/seq_len:.2%}", flush=True)

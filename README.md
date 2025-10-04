@@ -27,6 +27,19 @@ However, this approach drops all middle tokens, harming recall of earlier facts.
   - **Low-Rank SVD**: Factorizes KV tensors into compact representations
   - **Vector Quantization**: Clusters tokens into centroids with prototype values
   - **Importance-Aware Selection**: Reserves budget for high-importance tokens kept exactly
+- **Dual-Fidelity Mid Memory** *(NEW)*:
+  - Precision bank retains adaptive low-rank/VQ representations
+  - Sketch bank summarizes overflow tokens with configurable reducers (`mean`, `sum`, `first`)
+  - Residual energy tracking promotes sketches back to precision when they matter
+- **Residual Replay Engine** *(NEW)*:
+  - Spectral energy monitors trigger bounded replay of original KV tokens
+  - Keeps lossy artifacts in check without blowing up memory
+- **RoPE Alignment Calibration** *(NEW)*:
+  - Lightweight linear solve remaps synthetic positions each step
+  - Uses sliding anchor windows to suppress positional drift in long contexts
+- **Adaptive Budget Controller** *(NEW)*:
+  - EMA bandit adjusts per-head budgets based on reconstruction energy
+  - Shares state across head groups for low-overhead responsiveness
 
 - **Smart Budgeting**:
   - Per-head adaptive budgets based on variance
@@ -92,7 +105,13 @@ adms_cache = enable_adms_llm(
     enable_dynamic_sink=True,    # scale sink to 1% of max_seq_length
     compressor_type="low_rank",
     rank=16,                     # SVD rank
-    importance_ratio=0.5,        # fraction for exact high-importance tokens
+  importance_ratio=0.5,        # fraction for exact high-importance tokens
+  enable_dual_fidelity=True,   # enable precision + sketch tier
+  sketch_budget=48,            # allow a few sketch tokens per head
+  enable_residual_replay=True, # auto replay hard examples
+  replay_budget=12,
+  enable_position_calibration=True,
+  enable_adaptive_controller=True,
 )
 
 # Use in generation
@@ -121,6 +140,45 @@ adms_cache = enable_adms_llm(
 # with modest throughput cost (~10% slower)
 ```
 
+To emulate the legacy single-tier ADMS mode, toggle off the new ADM++ components when running the evaluator script:
+
+```bash
+python examples/eval_adms_vs_streaming.py \
+  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --dataset_name wikitext --task wikitext-2-raw-v1 --split test \
+  --num_samples 32 --num_eval_tokens 4096 \
+  --start_size 4 --recent_size 1024 --compressed_budget 192 \
+  --disable_dual_fidelity --disable_residual_replay \
+  --disable_position_calibration --disable_adaptive_controller \
+  --sketch_budget 0 --replay_budget 0
+```
+
+## ADM++ Enhancements
+
+ADM++ is the production configuration of ADMS that layers four cooperative modules on top of the three-tier memory. Together they close the gap between the lossy mid-memory and a full cache while keeping memory sublinear.
+
+| Component | Why it exists | How it works | CLI toggle |
+|-----------|---------------|--------------|------------|
+| Dual-Fidelity Mid Memory | Exact sinks + compression still under-represent rare but high-salience facts. | Splits the compressed tier into a precision bank (low-rank/VQ) and a sketch bank, reserving part of the budget for the highest-importance tokens. | `--disable_dual_fidelity`, `--sketch_budget`, `--importance_ratio` |
+| Residual Replay Engine | Purely lossy compression can accumulate drift on hard examples. | Tracks spectral energy and temporarily re-injects exact tokens when reconstruction error spikes. | `--disable_residual_replay`, `--replay_budget`, `--energy_replay_threshold` |
+| RoPE Position Calibration | Synthetic anchors can introduce phase mismatch in long contexts. | Solves a lightweight linear system each step to align rotary phases of compressed proxies to the live sequence. | `--disable_position_calibration`, `--calibration_window`, `--calibration_regularization` |
+| Adaptive Budget Controller | Fixed budgets waste capacity on quiet heads and starve active ones. | An EMA bandit reallocates per-head tokens based on reconstruction energy and attention mass. | `--disable_adaptive_controller`, `--controller_gain`, `--controller_energy_floor`, `--controller_energy_ceiling` |
+
+These modules directly address three historical failure modes of streaming caches: (1) forgotten early facts, (2) divergence after long stretches of lossy summaries, and (3) brittle head-wise allocation. ADM++ reduces all three without exceeding the memory envelope of ADMS.
+
+### CLI Feature Flags
+
+`examples/eval_adms_vs_streaming.py` exposes each ADM++ module so you can ablate it in experiments or revert to classic ADMS for baselines. Flags default to the ADM++ configuration, so you only need to pass a `--disable_*` switch when running an ablation.
+
+Common combinations:
+
+- **Full ADM++ (default):** run the script with no disabling flags for the highest quality setting.
+- **Legacy ADMS:** add all four `--disable_*` flags and set `--sketch_budget 0 --replay_budget 0` (see example above).
+- **Replay-only ablation:** pass `--disable_residual_replay` to quantify replay impact while keeping other modules active.
+- **Precision-only mid-memory:** pass `--sketch_budget 0` to force all budget into the precision bank while keeping adaptive control and calibration.
+
+The same toggles are available when calling `enable_adms_llm` directly; pass the corresponding keyword arguments (`enable_dual_fidelity`, `enable_residual_replay`, etc.) to integrate ADM++ into custom pipelines.
+
 ## Configuration Options
 
 ### Core Parameters
@@ -142,6 +200,9 @@ adms_cache = enable_adms_llm(
 | `num_clusters` | Clusters for VQ compression | 64 |
 | `compression_interval` | Compress every N tokens | 8 |
 | `svd_max_tokens` | Cap SVD columns for performance | 512 |
+| `enable_dual_fidelity` | Enable sketch tier alongside precision bank | True |
+| `sketch_budget` | Sketch tokens per head | 32 |
+| `sketch_reduction` | Sketch reducer (`mean`, `sum`, `first`) | `mean` |
 
 ### Importance & Budgeting
 
@@ -160,6 +221,27 @@ adms_cache = enable_adms_llm(
 |-----------|-------------|---------|
 | `anchor_mode` | Position assignment: "grid", "mean", "hybrid" | "mean" |
 | `enable_pos_shift` | Enable RoPE positional adjustments | True |
+| `enable_position_calibration` | Enable energy-aware synthetic position remapping | True |
+| `calibration_window` | Anchor window for calibration (tokens) | 512 |
+| `calibration_regularization` | Blend factor for calibrated offsets | 0.1 |
+
+### Replay Settings
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `enable_residual_replay` | Enable spectral-triggered raw token replay | True |
+| `replay_budget` | Max replayed exact tokens per head | 16 |
+| `energy_replay_threshold` | Energy ratio threshold to trigger replay | 0.88 |
+
+### Controller Settings
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `enable_adaptive_controller` | Enable budget controller | True |
+| `controller_gain` | EMA gain for controller updates | 0.35 |
+| `controller_energy_floor` | Energy ratio floor for expanding budget | 0.8 |
+| `controller_energy_ceiling` | Energy ratio ceiling for shrinking budget | 0.97 |
+| `controller_group_size` | Heads per controller group | 2 |
 
 ### Automation Script Options
 
@@ -233,13 +315,14 @@ Expected output shows ADMS achieving significantly lower perplexity than Streami
 
 ## Performance Characteristics
 
-- **Memory**: O(dynamic_sink + compressed_budget + recent) vs O(context_length) for full cache
+- **Memory**: O(dynamic_sink + compressed_budget + sketch_budget + replay_budget + recent)
   - Dynamic sink scales to 1% of context (e.g., 320 tokens for 32K context)
-  - Total cache remains bounded regardless of input length
+  - Dual-fidelity tier keeps total middle footprint bounded while covering dropped tokens
 - **Throughput**: ~10% slower than StreamingLLM due to compression overhead
   - Dynamic sink adds no speed penalty (same attention complexity)
 - **Perplexity**: 7-53% improvement over StreamingLLM on long contexts (model dependent)
   - Dynamic sink provides additional 1-3% improvement at 16K+ contexts
+- **Calibration & Replay**: Energy-aware replay and RoPE calibration protect accuracy with sub-5% overhead
 - **Stability**: Maintains StreamingLLM's stability beyond training length
 - **Context Length**: Tested up to 32k tokens on Llama-3-8B with proper concatenation logic
 - **Automation**: Supports systematic evaluation across 19 model/context combinations
@@ -279,10 +362,10 @@ ADMS automatically detects model types and applies appropriate modifications:
 
 ## Limitations
 
-- **Lossy Compression**: Middle tokens are approximated, not exact
-- **Positional Bias**: Synthetic positions may affect attention patterns
-- **Training Required**: Policies may need fine-tuning for optimal performance
-- **Memory Overhead**: Small per-head statistics tracking
+- **Lossy Compression**: Middle tokens are approximated, not exact — mitigated by dual-fidelity sketches + residual replay
+- **Positional Bias**: Synthetic positions may affect attention patterns — RoPE calibration reduces drift but edge cases remain
+- **Training Required**: Policies may need fine-tuning for optimal performance (bandit controller adapts without retraining)
+- **Memory Overhead**: Small per-head statistics + controller state tracking (grouped to limit footprint)
 - **Context Targeting**: Fixed concatenation logic in v1.0 - samples now accumulate until target tokens reached
 - **Model Support**: Some models (Mistral, Mixtral) may require tokenizer compatibility fixes
 

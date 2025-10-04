@@ -239,6 +239,30 @@ def parse_args():
     p.add_argument("--coverage_segments", type=int, default=4, help="Split middle region into this many segments for coverage-aware retention")
     p.add_argument("--coverage_priority", type=float, default=0.3, help="Fraction of budget reserved for per-segment coverage (0 disables)")
 
+    # ADM++ feature toggles
+    p.add_argument("--sketch_budget", type=int, default=32, help="Sketch-tier tokens per head when dual fidelity is enabled")
+    p.add_argument("--replay_budget", type=int, default=16, help="Replay budget per head when residual replay is enabled")
+    p.add_argument("--controller_gain", type=float, default=0.35)
+    p.add_argument("--controller_energy_floor", type=float, default=0.8)
+    p.add_argument("--controller_energy_ceiling", type=float, default=0.97)
+    p.add_argument("--controller_group_size", type=int, default=2)
+
+    p.add_argument("--enable_dual_fidelity", dest="enable_dual_fidelity", action="store_true", help="Enable sketch-tier dual fidelity (default)")
+    p.add_argument("--disable_dual_fidelity", dest="enable_dual_fidelity", action="store_false", help="Disable sketch-tier dual fidelity")
+    p.set_defaults(enable_dual_fidelity=True)
+
+    p.add_argument("--enable_residual_replay", dest="enable_residual_replay", action="store_true", help="Enable residual replay (default)")
+    p.add_argument("--disable_residual_replay", dest="enable_residual_replay", action="store_false", help="Disable residual replay")
+    p.set_defaults(enable_residual_replay=True)
+
+    p.add_argument("--enable_position_calibration", dest="enable_position_calibration", action="store_true", help="Enable energy-aware position calibration (default)")
+    p.add_argument("--disable_position_calibration", dest="enable_position_calibration", action="store_false", help="Disable position calibration")
+    p.set_defaults(enable_position_calibration=True)
+
+    p.add_argument("--enable_adaptive_controller", dest="enable_adaptive_controller", action="store_true", help="Enable adaptive budget controller (default)")
+    p.add_argument("--disable_adaptive_controller", dest="enable_adaptive_controller", action="store_false", help="Disable adaptive budget controller")
+    p.set_defaults(enable_adaptive_controller=True)
+
     # Misc
     p.add_argument("--log_every", type=int, default=256)
     p.add_argument("--text_field", type=str, default="text", help="Field name in dataset item containing input text")
@@ -294,6 +318,16 @@ def main():
         compression_middle_threshold=args.compression_middle_threshold,
         coverage_segments=args.coverage_segments,
         coverage_priority=args.coverage_priority,
+        enable_dual_fidelity=args.enable_dual_fidelity,
+        sketch_budget=args.sketch_budget,
+        enable_residual_replay=args.enable_residual_replay,
+        replay_budget=args.replay_budget,
+        enable_position_calibration=args.enable_position_calibration,
+        enable_adaptive_controller=args.enable_adaptive_controller,
+        controller_gain=args.controller_gain,
+        controller_energy_floor=args.controller_energy_floor,
+        controller_energy_ceiling=args.controller_energy_ceiling,
+        controller_group_size=args.controller_group_size,
     )
 
     adms_ppl, adms_speed, adms_time, adms_tokens = evaluate_method(

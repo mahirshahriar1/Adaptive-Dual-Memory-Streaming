@@ -40,6 +40,20 @@ def enable_adms_llm(
     compression_middle_threshold: int = 256,
     coverage_segments: int = 4,
     coverage_priority: float = 0.3,
+    enable_dual_fidelity: bool = True,
+    sketch_budget: int = 32,
+    sketch_reduction: str = "mean",
+    enable_residual_replay: bool = True,
+    replay_budget: int = 16,
+    energy_replay_threshold: float = 0.88,
+    enable_position_calibration: bool = True,
+    calibration_window: int = 512,
+    calibration_regularization: float = 0.1,
+    enable_adaptive_controller: bool = True,
+    controller_gain: float = 0.35,
+    controller_energy_floor: float = 0.8,
+    controller_energy_ceiling: float = 0.97,
+    controller_group_size: int = 2,
 ):
     """
     Enable ADMS (Adaptive Dual-Memory Streaming) for a language model.
@@ -135,6 +149,20 @@ def enable_adms_llm(
         compression_middle_threshold=compression_middle_threshold,
         coverage_segments=coverage_segments,
         coverage_priority=coverage_priority,
+        enable_dual_fidelity=enable_dual_fidelity,
+        sketch_budget=sketch_budget,
+        sketch_reduction=sketch_reduction,
+        enable_residual_replay=enable_residual_replay,
+        replay_budget=replay_budget,
+        energy_replay_threshold=energy_replay_threshold,
+        enable_position_calibration=enable_position_calibration,
+        calibration_window=calibration_window,
+        calibration_regularization=calibration_regularization,
+        enable_adaptive_controller=enable_adaptive_controller,
+        controller_gain=controller_gain,
+        controller_energy_floor=controller_energy_floor,
+        controller_energy_ceiling=controller_energy_ceiling,
+        controller_group_size=controller_group_size,
     )
     
     # Create and return ADMS KV cache
@@ -161,6 +189,11 @@ def enable_adms_llm(
     print(f"    * min_middle_size_for_compress: {min_middle_size_for_compress}")
     print(f"    * coverage_segments: {coverage_segments}")
     print(f"    * coverage_priority: {coverage_priority}")
+    print("  - Enhancements:")
+    print(f"    * dual_fidelity: {enable_dual_fidelity} (budget={sketch_budget}, reduction={sketch_reduction})")
+    print(f"    * residual_replay: {enable_residual_replay} (budget={replay_budget}, threshold={energy_replay_threshold})")
+    print(f"    * position_calibration: {enable_position_calibration} (window={calibration_window}, reg={calibration_regularization})")
+    print(f"    * adaptive_controller: {enable_adaptive_controller} (gain={controller_gain}, floor={controller_energy_floor}, ceiling={controller_energy_ceiling}, group={controller_group_size})")
     
     return adms_cache
 

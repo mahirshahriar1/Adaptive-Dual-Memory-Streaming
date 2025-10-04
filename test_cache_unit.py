@@ -25,6 +25,7 @@ config = ADMSConfig(
 )
 
 cache = ADMSKVCache(config)
+effective_sink = cache.dynamic_start_size if config.enable_dynamic_sink else config.start_size
 
 # Simulate cache growth
 num_layers = 2
@@ -48,7 +49,12 @@ for seq_len in [260, 268, 300, 350, 400, 500, 600, 700, 772, 800, 1000, 1500, 20
     
     # Check result size
     result_size = result[0][0].shape[2]
-    expected_max = config.start_size + config.compressed_budget + config.recent_size
+    middle_allocation = config.compressed_budget
+    if config.enable_dual_fidelity:
+        middle_allocation += config.sketch_budget
+    if config.enable_residual_replay:
+        middle_allocation += config.replay_budget
+    expected_max = effective_sink + middle_allocation + config.recent_size
     
     status = "✓ OK" if result_size <= expected_max else "✗ BUG!"
     print(f"seq_len={seq_len:4d} → cache_size={result_size:4d} (max={expected_max}) {status}")
@@ -63,6 +69,8 @@ for seq_len in [260, 268, 300, 350, 400, 500, 600, 700, 772, 800, 1000, 1500, 20
 print("-" * 60)
 print("\nTest complete!")
 print(f"Total compressions: {cache.stats['total_compressions']}")
+print(f"Total replay tokens: {cache.stats['total_replay_tokens']}")
+print(f"Total sketch tokens: {cache.stats['total_sketch_tokens']}")
 
 if cache.stats['total_compressions'] == 0:
     print("❌ FAIL: No compressions ran!")
