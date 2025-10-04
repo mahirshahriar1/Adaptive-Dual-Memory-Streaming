@@ -194,27 +194,6 @@ The automation script supports:
 - **Aggregated reporting**: CSV + Markdown with model/dataset/context metadata
 - **Automatic token targeting**: Fixed concatenation logic ensures proper context lengths
 
-### Needle in a Haystack Benchmark 🎯
-
-Test retrieval of specific information hidden in long contexts:
-
-```bash
-# Run needle in haystack evaluation
-bash run_needle_haystack.sh
-
-# Or Windows PowerShell
-.\run_needle_haystack.ps1
-
-# Manual run with custom settings
-python examples/eval_needle_in_haystack.py \
-  --model_name_or_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --context_lengths 2000 4000 8000 \
-  --needle_positions 0.1 0.5 0.9 \
-  --num_trials 3 \
-  --output_dir outputs/needle_haystack
-```
-
-See [NEEDLE_HAYSTACK.md](NEEDLE_HAYSTACK.md) for detailed documentation.
 
 ### Manual Evaluation
 

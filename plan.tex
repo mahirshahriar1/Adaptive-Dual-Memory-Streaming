@@ -191,15 +191,6 @@ Wikitext-103-raw-v1 and wikitext-2-raw-v1 for comprehensive language modeling ev
 \paragraph{Metrics.}
 (1) Perplexity vs.\ effective stream length; (2) Retrieval accuracy of mid-sequence facts; (3) Throughput (tok/s) and peak GPU memory; (4) Stability beyond training length; (5) Perplexity improvement percentage over \streaming{}.
 
-\paragraph{Needle in a Haystack Evaluation.}
-We implement a comprehensive retrieval benchmark that hides specific information (``needles'') within long contexts (``haystacks''). For each test:
-\begin{itemize}
-  \item Insert a unique fact at position $p \in \{0.1, 0.5, 0.9\}$ (early, middle, late)
-  \item Vary context length $L \in \{2\text{k}, 4\text{k}, 8\text{k}, 16\text{k}\}$ tokens
-  \item Query the model to retrieve the hidden information
-  \item Measure: (a) binary retrieval accuracy, (b) needle-specific perplexity, (c) overall sequence perplexity
-\end{itemize}
-This test directly measures \model{}'s advantage: compressed mid-memory should preserve needles at position $p=0.5$ that \streaming{} completely evicts. Automated pipeline supports multiple trials, visualization, and LaTeX/Markdown reporting.
 
 \paragraph{Baselines.}
 Sliding-window recomputation; \streaming{} (sinks+recent only); ablations over compressor and policy.
@@ -305,7 +296,6 @@ By enabling practical, near-infinite streaming with bounded memory, \model{} red
   \item Report: PPL vs.\ stream length, retrieval accuracy, tokens/s, GPU RAM, aggregated CSV/Markdown.
   \item Ablations: static vs dynamic sink ($k$ vs $k^*$), $L$, budget $B$, compressor type, policy type, position anchoring.
   \item Models tested: TinyLlama-1.1B, OPT-1.3B, Meta-Llama-3-8B, Pythia-6.9B, Falcon-7B, MPT-7B, up to 32k context.
-  \item Needle benchmark: Tests 2k-16k contexts with needles at 10\%, 50\%, 90\% positions.
   \item Dynamic sink: Enabled by default in automation scripts; compare with \texttt{--enable\_dynamic\_sink=False} for ablation.
 \end{itemize}
 
