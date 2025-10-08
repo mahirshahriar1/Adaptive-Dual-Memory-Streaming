@@ -241,11 +241,15 @@ def parse_args():
 
     # ADM++ feature toggles
     p.add_argument("--sketch_budget", type=int, default=32, help="Sketch-tier tokens per head when dual fidelity is enabled")
+    p.add_argument("--sketch_reduction", type=str, default="mean", choices=["mean", "sum", "first"], help="Sketch reduction strategy")
     p.add_argument("--replay_budget", type=int, default=16, help="Replay budget per head when residual replay is enabled")
-    p.add_argument("--controller_gain", type=float, default=0.35)
-    p.add_argument("--controller_energy_floor", type=float, default=0.8)
-    p.add_argument("--controller_energy_ceiling", type=float, default=0.97)
-    p.add_argument("--controller_group_size", type=int, default=2)
+    p.add_argument("--energy_replay_threshold", type=float, default=0.88, help="Energy threshold to trigger replay (lower = more aggressive)")
+    p.add_argument("--calibration_window", type=int, default=512, help="Sliding window size for calibration anchors")
+    p.add_argument("--calibration_regularization", type=float, default=0.1, help="Regularization for calibration linear solve")
+    p.add_argument("--controller_gain", type=float, default=0.35, help="EMA gain for controller state updates")
+    p.add_argument("--controller_energy_floor", type=float, default=0.8, help="Energy floor threshold (below = increase budget)")
+    p.add_argument("--controller_energy_ceiling", type=float, default=0.97, help="Energy ceiling threshold (above = decrease budget)")
+    p.add_argument("--controller_group_size", type=int, default=2, help="Number of heads per group for shared state")
 
     p.add_argument("--enable_dual_fidelity", dest="enable_dual_fidelity", action="store_true", help="Enable sketch-tier dual fidelity (default)")
     p.add_argument("--disable_dual_fidelity", dest="enable_dual_fidelity", action="store_false", help="Disable sketch-tier dual fidelity")
@@ -320,9 +324,13 @@ def main():
         coverage_priority=args.coverage_priority,
         enable_dual_fidelity=args.enable_dual_fidelity,
         sketch_budget=args.sketch_budget,
+        sketch_reduction=args.sketch_reduction,
         enable_residual_replay=args.enable_residual_replay,
         replay_budget=args.replay_budget,
+        energy_replay_threshold=args.energy_replay_threshold,
         enable_position_calibration=args.enable_position_calibration,
+        calibration_window=args.calibration_window,
+        calibration_regularization=args.calibration_regularization,
         enable_adaptive_controller=args.enable_adaptive_controller,
         controller_gain=args.controller_gain,
         controller_energy_floor=args.controller_energy_floor,

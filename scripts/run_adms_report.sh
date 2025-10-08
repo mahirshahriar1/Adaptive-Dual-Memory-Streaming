@@ -32,14 +32,26 @@ FORCE_RERUN=${FORCE_RERUN:-0}
 
 mkdir -p "${OUTPUT_ROOT}"
 
-# Define evaluation profiles (balanced + quality-focused)
+# Define evaluation profiles (balanced + quality-focused + ADM++ profiles)
 # and model/dataset scenarios. Each entry is a space-separated
 # string of key=value pairs. Feel free to extend both lists.
 # NOTE: Long-context (≥8k) scenarios below assume you have enough VRAM
 # and have accepted any gated model licenses on Hugging Face.
 PROFILES=(
-    "name=balanced start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1"
-    "name=quality start=4 recent=128 budget=128 ratio=0.75 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1"
+    # Legacy ADMS profiles (all ADM++ features disabled)
+    "name=legacy_balanced start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=0 replay_budget=0 disable_dual_fidelity=1 disable_replay=1 disable_calibration=1 disable_controller=1"
+    "name=legacy_quality start=4 recent=128 budget=128 ratio=0.75 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=0 replay_budget=0 disable_dual_fidelity=1 disable_replay=1 disable_calibration=1 disable_controller=1"
+    
+    # ADM++ profiles (all features enabled with different budgets)
+    "name=adm_plus_plus_small start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=32 replay_budget=16 sketch_reduction=mean energy_threshold=0.88 calib_window=512 calib_reg=0.1"
+    "name=adm_plus_plus_balanced start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=64 replay_budget=32 sketch_reduction=mean energy_threshold=0.88 calib_window=512 calib_reg=0.1"
+    "name=adm_plus_plus_quality start=4 recent=128 budget=128 ratio=0.75 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=128 replay_budget=64 sketch_reduction=mean energy_threshold=0.85 calib_window=1024 calib_reg=0.05"
+    
+    # Feature ablation profiles
+    "name=dual_fidelity_only start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=64 replay_budget=0 sketch_reduction=mean disable_replay=1 disable_calibration=1 disable_controller=1"
+    "name=replay_only start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=0 replay_budget=32 energy_threshold=0.88 disable_dual_fidelity=1 disable_calibration=1 disable_controller=1"
+    "name=calibration_only start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=0 replay_budget=0 calib_window=512 calib_reg=0.1 disable_dual_fidelity=1 disable_replay=1 disable_controller=1"
+    "name=controller_only start=4 recent=256 budget=128 ratio=0.6 interval=64 rank=8 svd=256 pos_shift=1 dynamic_sink=1 sketch_budget=0 replay_budget=0 disable_dual_fidelity=1 disable_replay=1 disable_calibration=1"
 )
 
 SCENARIOS=(
@@ -127,6 +139,46 @@ run_combination() {
         dynamic_sink_flag="--enable_dynamic_sink"
     fi
 
+    # Build ADM++ feature flags
+    local sketch_budget_args=()
+    if [[ -n "${cfg[sketch_budget]:-}" && "${cfg[sketch_budget]}" != "0" ]]; then
+        sketch_budget_args=(--sketch_budget "${cfg[sketch_budget]}")
+        if [[ -n "${cfg[sketch_reduction]:-}" ]]; then
+            sketch_budget_args+=(--sketch_reduction "${cfg[sketch_reduction]}")
+        fi
+    fi
+
+    local replay_budget_args=()
+    if [[ -n "${cfg[replay_budget]:-}" && "${cfg[replay_budget]}" != "0" ]]; then
+        replay_budget_args=(--replay_budget "${cfg[replay_budget]}")
+        if [[ -n "${cfg[energy_threshold]:-}" ]]; then
+            replay_budget_args+=(--energy_replay_threshold "${cfg[energy_threshold]}")
+        fi
+    fi
+
+    local calibration_args=()
+    if [[ -n "${cfg[calib_window]:-}" ]]; then
+        calibration_args=(--calibration_window "${cfg[calib_window]}")
+        if [[ -n "${cfg[calib_reg]:-}" ]]; then
+            calibration_args+=(--calibration_regularization "${cfg[calib_reg]}")
+        fi
+    fi
+
+    # Build disable flags
+    local disable_flags=""
+    if [[ "${cfg[disable_dual_fidelity]:-0}" == "1" ]]; then
+        disable_flags="${disable_flags} --disable_dual_fidelity"
+    fi
+    if [[ "${cfg[disable_replay]:-0}" == "1" ]]; then
+        disable_flags="${disable_flags} --disable_residual_replay"
+    fi
+    if [[ "${cfg[disable_calibration]:-0}" == "1" ]]; then
+        disable_flags="${disable_flags} --disable_position_calibration"
+    fi
+    if [[ "${cfg[disable_controller]:-0}" == "1" ]]; then
+        disable_flags="${disable_flags} --disable_adaptive_controller"
+    fi
+
     python examples/eval_adms_vs_streaming.py \
         --model_name_or_path "${model_name}" \
         --dataset_name "${dataset_name}" \
@@ -144,6 +196,10 @@ run_combination() {
         --svd_max_tokens "${cfg[svd]}" \
         --max_seq_length "${max_seq_length}" \
         ${dynamic_sink_flag} \
+        "${sketch_budget_args[@]}" \
+        "${replay_budget_args[@]}" \
+        "${calibration_args[@]}" \
+        ${disable_flags} \
         --log_every "${log_every_value}" \
         --min_seq_len "${min_seq_len_value}" \
         --output_dir "${out_dir}" \

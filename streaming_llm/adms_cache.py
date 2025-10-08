@@ -223,6 +223,23 @@ class ADMSKVCache:
         self.policies = {}
         self._variance_ema: Dict[Tuple[int, int], float] = {}
         
+        # Dual-Fidelity: sketch bank storage per head
+        self.sketch_bank: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        self.sketch_energies: Dict[Tuple[int, int], torch.Tensor] = {}  # residual energies per sketch token
+        
+        # Residual Replay: original token storage for replay
+        self.replay_bank: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        self.replay_energies: Dict[Tuple[int, int], float] = {}  # reconstruction energy per head
+        
+        # Position Calibration: anchor state tracking
+        self.calibration_anchors: Dict[Tuple[int, int], torch.Tensor] = {}  # recent anchor positions
+        self.calibration_offsets: Dict[Tuple[int, int], torch.Tensor] = {}  # learned position offsets
+        
+        # Adaptive Controller: per-head budget state
+        self.controller_budgets: Dict[Tuple[int, int], int] = {}  # current budget per head
+        self.controller_energy_ema: Dict[Tuple[int, int], float] = {}  # reconstruction energy EMA
+        self.controller_attention_mass: Dict[Tuple[int, int], float] = {}  # attention mass EMA
+        
         # Current sequence length
         self.current_length = 0
         self.last_compress_len = 0  # throttling checkpoint
@@ -235,6 +252,10 @@ class ADMSKVCache:
             "total_middle_dropped": 0,
             "total_sketch_tokens": 0,
             "total_replay_tokens": 0,
+            "total_sketch_promotions": 0,
+            "total_replay_triggers": 0,
+            "total_calibrations": 0,
+            "total_budget_adjustments": 0,
         }
 
         self.middle_allocation = self.compressed_budget
@@ -370,10 +391,114 @@ class ADMSKVCache:
         self._variance_ema[key] = updated
         return updated
 
+    def _update_controller_state(self, layer_idx: int, head_idx: int, 
+                                   reconstruction_energy: float, attention_mass: float):
+        """
+        Update adaptive controller state with reconstruction energy and attention mass
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            reconstruction_energy: Energy ratio (lower = need more budget)
+            attention_mass: Attention weight sum for this head
+        """
+        if not self.config.enable_adaptive_controller:
+            return
+        
+        key = (layer_idx, head_idx)
+        gain = self.config.controller_gain
+        
+        # Update energy EMA
+        if key not in self.controller_energy_ema:
+            self.controller_energy_ema[key] = reconstruction_energy
+        else:
+            self.controller_energy_ema[key] = (1 - gain) * self.controller_energy_ema[key] + gain * reconstruction_energy
+        
+        # Update attention mass EMA
+        if key not in self.controller_attention_mass:
+            self.controller_attention_mass[key] = attention_mass
+        else:
+            self.controller_attention_mass[key] = (1 - gain) * self.controller_attention_mass[key] + gain * attention_mass
+    
+    def _get_adaptive_budget(self, layer_idx: int, head_idx: int, base_budget: int) -> int:
+        """
+        Get adaptive budget based on reconstruction energy and attention mass
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            base_budget: Base budget allocation
+            
+        Returns:
+            Adjusted budget
+        """
+        if not self.config.enable_adaptive_controller:
+            return base_budget
+        
+        # Head grouping: share state across groups
+        group_size = max(1, self.config.controller_group_size)
+        group_id = (layer_idx, head_idx // group_size)
+        
+        # Collect energy and attention from heads in this group
+        group_energies = []
+        group_attention = []
+        
+        for h in range((head_idx // group_size) * group_size, 
+                       (head_idx // group_size + 1) * group_size):
+            head_key = (layer_idx, h)
+            if head_key in self.controller_energy_ema:
+                group_energies.append(self.controller_energy_ema[head_key])
+            if head_key in self.controller_attention_mass:
+                group_attention.append(self.controller_attention_mass[head_key])
+        
+        if not group_energies:
+            # No history yet
+            return base_budget
+        
+        # Use group average for shared state
+        avg_energy = sum(group_energies) / len(group_energies)
+        avg_attention = sum(group_attention) / len(group_attention) if group_attention else 1.0
+        
+        # Decision logic
+        floor = self.config.controller_energy_floor
+        ceiling = self.config.controller_energy_ceiling
+        
+        if avg_energy < floor:
+            # Low energy = poor reconstruction, increase budget
+            scale = 1.0 + (floor - avg_energy) * 2.0  # Up to 2x more
+        elif avg_energy > ceiling:
+            # High energy = good reconstruction, can reduce budget
+            scale = 0.8  # Reduce by 20%
+        else:
+            # In acceptable range
+            scale = 1.0
+        
+        # Adjust by attention mass (high attention = more important head)
+        attention_scale = 0.8 + 0.4 * min(1.0, avg_attention)  # Range [0.8, 1.2]
+        
+        adjusted_budget = int(base_budget * scale * attention_scale)
+        adjusted_budget = max(1, min(adjusted_budget, base_budget * 2))  # Clamp to [1, 2*base]
+        
+        # Cache the adjusted budget
+        key = (layer_idx, head_idx)
+        self.controller_budgets[key] = adjusted_budget
+        self.stats["total_budget_adjustments"] += 1
+        
+        return adjusted_budget
+
     def _scaled_budget(self, layer_idx: int, head_idx: int, middle_k: torch.Tensor, middle_v: torch.Tensor) -> int:
         base_budget = int(self.compressed_budget)
         if base_budget <= 0:
             return 0
+        
+        # If adaptive controller is enabled, use it instead of variance-based scaling
+        if self.config.enable_adaptive_controller:
+            # Check if we have controller state
+            key = (layer_idx, head_idx)
+            if key in self.controller_budgets:
+                return self.controller_budgets[key]
+            # Otherwise fall through to base budget
+            return base_budget
+        
+        # Legacy variance-based scaling (kept for backward compatibility)
         if not getattr(self.config, "use_adaptive_budget", False):
             return base_budget
 
@@ -423,6 +548,439 @@ class ADMSKVCache:
             scores = torch.norm(values, dim=1)
 
         return self._normalize_scores(scores)
+
+    def _apply_sketch_reduction(self, tokens_k: torch.Tensor, tokens_v: torch.Tensor, reduction: str = "mean") -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply sketch reduction to overflow tokens
+        
+        Args:
+            tokens_k: Key tokens to sketch [seq_len, d_k]
+            tokens_v: Value tokens to sketch [seq_len, d_v]
+            reduction: 'mean', 'sum', or 'first'
+            
+        Returns:
+            Sketched single token (k, v)
+        """
+        if tokens_k.shape[0] == 0:
+            return tokens_k[:0], tokens_v[:0]
+        
+        if reduction == "mean":
+            sketch_k = tokens_k.mean(dim=0, keepdim=True)  # [1, d_k]
+            sketch_v = tokens_v.mean(dim=0, keepdim=True)  # [1, d_v]
+        elif reduction == "sum":
+            sketch_k = tokens_k.sum(dim=0, keepdim=True)
+            sketch_v = tokens_v.sum(dim=0, keepdim=True)
+        elif reduction == "first":
+            sketch_k = tokens_k[:1]
+            sketch_v = tokens_v[:1]
+        else:
+            # Fallback to mean
+            sketch_k = tokens_k.mean(dim=0, keepdim=True)
+            sketch_v = tokens_v.mean(dim=0, keepdim=True)
+        
+        return sketch_k, sketch_v
+    
+    def _compute_residual_energy(self, original_k: torch.Tensor, original_v: torch.Tensor, 
+                                  approx_k: torch.Tensor, approx_v: torch.Tensor) -> float:
+        """
+        Compute residual energy between original and approximation
+        
+        Args:
+            original_k, original_v: Original tensors
+            approx_k, approx_v: Approximated tensors
+            
+        Returns:
+            Energy ratio (0=perfect reconstruction, 1=complete loss)
+        """
+        if original_k.shape[0] == 0 or approx_k.shape[0] == 0:
+            return 0.0
+        
+        # Compute reconstruction error
+        if original_k.shape == approx_k.shape:
+            k_error = torch.norm(original_k - approx_k).item()
+            v_error = torch.norm(original_v - approx_v).item()
+        else:
+            # Different sizes - measure coverage loss
+            k_error = torch.norm(original_k).item()
+            v_error = torch.norm(original_v).item()
+        
+        k_total = torch.norm(original_k).item() + 1e-8
+        v_total = torch.norm(original_v).item() + 1e-8
+        
+        # Energy ratio: higher = more loss
+        energy = (k_error + v_error) / (k_total + v_total)
+        return min(1.0, max(0.0, energy))
+    
+    def _update_sketch_bank(self, layer_idx: int, head_idx: int, overflow_k: torch.Tensor, 
+                             overflow_v: torch.Tensor, overflow_positions: torch.Tensor):
+        """
+        Update sketch bank with overflow tokens
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            overflow_k, overflow_v: Overflow tokens
+            overflow_positions: Original positions of overflow tokens
+        """
+        if not self.config.enable_dual_fidelity:
+            return
+        
+        if overflow_k.shape[0] == 0:
+            return
+        
+        key = (layer_idx, head_idx)
+        reduction = getattr(self.config, "sketch_reduction", "mean")
+        
+        # Create sketch from overflow
+        sketch_k, sketch_v = self._apply_sketch_reduction(overflow_k, overflow_v, reduction)
+        
+        # Compute residual energy for this sketch
+        energy = self._compute_residual_energy(overflow_k, overflow_v, sketch_k, sketch_v)
+        
+        # Store in sketch bank
+        if key not in self.sketch_bank:
+            self.sketch_bank[key] = {"keys": [], "values": [], "positions": [], "original_k": [], "original_v": []}
+            self.sketch_energies[key] = []
+        
+        self.sketch_bank[key]["keys"].append(sketch_k)
+        self.sketch_bank[key]["values"].append(sketch_v)
+        # Use mean position for sketch
+        sketch_position = overflow_positions.float().mean().long()
+        self.sketch_bank[key]["positions"].append(sketch_position)
+        
+        # Store original tokens for potential promotion
+        self.sketch_bank[key]["original_k"].append(overflow_k)
+        self.sketch_bank[key]["original_v"].append(overflow_v)
+        self.sketch_energies[key].append(energy)
+        
+        self.stats["total_sketch_tokens"] += 1
+    
+    def _promote_sketches_to_precision(self, layer_idx: int, head_idx: int, promotion_budget: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Promote high-energy sketches back to precision bank
+        
+        Args:
+            layer_idx, head_idx: Head identifier  
+            promotion_budget: Number of sketches to promote
+            
+        Returns:
+            Promoted (keys, values, positions) or empty tensors
+        """
+        if not self.config.enable_dual_fidelity or promotion_budget <= 0:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        key = (layer_idx, head_idx)
+        if key not in self.sketch_bank or not self.sketch_energies[key]:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        # Sort sketches by energy (highest first)
+        energies = torch.tensor(self.sketch_energies[key])
+        if energies.numel() == 0:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        # Select top-k high-energy sketches to promote
+        num_promote = min(promotion_budget, len(self.sketch_energies[key]))
+        if num_promote == 0:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        top_indices = torch.topk(energies, k=num_promote, largest=True).indices
+        
+        promoted_k = []
+        promoted_v = []
+        promoted_pos = []
+        
+        # Promote selected sketches (use original tokens, not sketch)
+        for idx in sorted(top_indices.tolist(), reverse=True):  # Remove from back to front
+            original_k = self.sketch_bank[key]["original_k"].pop(idx)
+            original_v = self.sketch_bank[key]["original_v"].pop(idx)
+            position = self.sketch_bank[key]["positions"].pop(idx)
+            
+            # Remove from sketch storage
+            self.sketch_bank[key]["keys"].pop(idx)
+            self.sketch_bank[key]["values"].pop(idx)
+            self.sketch_energies[key].pop(idx)
+            
+            # Subsample if original is too large
+            max_tokens_per_sketch = 8  # Limit promoted tokens per sketch
+            if original_k.shape[0] > max_tokens_per_sketch:
+                indices = torch.linspace(0, original_k.shape[0] - 1, max_tokens_per_sketch, dtype=torch.long, device=original_k.device)
+                original_k = original_k[indices]
+                original_v = original_v[indices]
+            
+            promoted_k.append(original_k)
+            promoted_v.append(original_v)
+            promoted_pos.append(position.repeat(original_k.shape[0]))
+            
+            self.stats["total_sketch_promotions"] += 1
+        
+        if not promoted_k:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        # Concatenate all promoted tokens
+        promoted_k = torch.cat(promoted_k, dim=0)
+        promoted_v = torch.cat(promoted_v, dim=0)
+        promoted_pos = torch.cat(promoted_pos, dim=0)
+        
+        return promoted_k, promoted_v, promoted_pos
+    
+    def _get_sketch_tokens(self, layer_idx: int, head_idx: int, budget: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Retrieve sketch tokens for attention, up to budget
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            budget: Maximum number of sketch tokens to return
+            
+        Returns:
+            (keys, values, positions) tensors
+        """
+        if not self.config.enable_dual_fidelity or budget <= 0:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        key = (layer_idx, head_idx)
+        if key not in self.sketch_bank:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        num_sketches = len(self.sketch_bank[key]["keys"])
+        if num_sketches == 0:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        # Return up to budget sketches
+        num_return = min(budget, num_sketches)
+        
+        keys = torch.cat(self.sketch_bank[key]["keys"][:num_return], dim=0)
+        values = torch.cat(self.sketch_bank[key]["values"][:num_return], dim=0)
+        positions = torch.stack(self.sketch_bank[key]["positions"][:num_return])
+        
+        return keys, values, positions
+    
+    def _update_replay_bank(self, layer_idx: int, head_idx: int, middle_k: torch.Tensor, 
+                             middle_v: torch.Tensor, middle_positions: torch.Tensor):
+        """
+        Store original tokens in replay bank for potential replay
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            middle_k, middle_v: Middle region tokens
+            middle_positions: Original positions
+        """
+        if not self.config.enable_residual_replay:
+            return
+        
+        key = (layer_idx, head_idx)
+        
+        # Store limited number of recent middle tokens for replay
+        max_replay_storage = self.config.replay_budget * 4  # Store 4x budget for selection
+        
+        if key not in self.replay_bank:
+            self.replay_bank[key] = {"keys": [], "values": [], "positions": []}
+        
+        # Add new tokens
+        self.replay_bank[key]["keys"].append(middle_k)
+        self.replay_bank[key]["values"].append(middle_v)
+        self.replay_bank[key]["positions"].append(middle_positions)
+        
+        # Limit storage size (FIFO)
+        while len(self.replay_bank[key]["keys"]) > max_replay_storage:
+            self.replay_bank[key]["keys"].pop(0)
+            self.replay_bank[key]["values"].pop(0)
+            self.replay_bank[key]["positions"].pop(0)
+    
+    def _compute_spectral_energy(self, approx_k: torch.Tensor, approx_v: torch.Tensor,
+                                  original_k: torch.Tensor, original_v: torch.Tensor) -> float:
+        """
+        Compute spectral energy ratio to detect reconstruction quality
+        
+        Args:
+            approx_k, approx_v: Compressed approximation
+            original_k, original_v: Original tokens
+            
+        Returns:
+            Energy ratio (lower = more loss, triggers replay)
+        """
+        if approx_k.shape[0] == 0 or original_k.shape[0] == 0:
+            return 1.0
+        
+        try:
+            # Compute spectral energy (top singular values)
+            _, S_approx, _ = torch.linalg.svd(approx_k.float().T, full_matrices=False)
+            _, S_orig, _ = torch.linalg.svd(original_k.float().T, full_matrices=False)
+            
+            # Take top-k singular values
+            k = min(8, min(S_approx.shape[0], S_orig.shape[0]))
+            if k == 0:
+                return 1.0
+            
+            energy_approx = torch.sum(S_approx[:k] ** 2).item()
+            energy_orig = torch.sum(S_orig[:k] ** 2).item()
+            
+            # Ratio: high = good preservation, low = trigger replay
+            ratio = energy_approx / (energy_orig + 1e-8)
+            return min(1.0, max(0.0, ratio))
+            
+        except Exception:
+            # Fallback: Frobenius norm ratio
+            norm_approx = torch.norm(approx_k).item()
+            norm_orig = torch.norm(original_k).item()
+            return norm_approx / (norm_orig + 1e-8)
+    
+    def _trigger_replay(self, layer_idx: int, head_idx: int, energy_ratio: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Trigger replay of original tokens if energy drops below threshold
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            energy_ratio: Current spectral energy ratio
+            
+        Returns:
+            Replayed (keys, values, positions) or empty tensors
+        """
+        if not self.config.enable_residual_replay:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        threshold = self.config.energy_replay_threshold
+        if energy_ratio >= threshold:
+            # Energy is good, no replay needed
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        key = (layer_idx, head_idx)
+        if key not in self.replay_bank or not self.replay_bank[key]["keys"]:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        # Replay budget: more tokens when energy is worse
+        urgency = (threshold - energy_ratio) / threshold  # 0 to 1
+        replay_count = max(1, int(self.config.replay_budget * urgency))
+        
+        # Select most recent tokens from replay bank
+        replay_k = []
+        replay_v = []
+        replay_pos = []
+        
+        tokens_to_replay = min(replay_count, len(self.replay_bank[key]["keys"]))
+        
+        for i in range(-tokens_to_replay, 0):  # Take from end (most recent)
+            replay_k.append(self.replay_bank[key]["keys"][i])
+            replay_v.append(self.replay_bank[key]["values"][i])
+            replay_pos.append(self.replay_bank[key]["positions"][i])
+        
+        if not replay_k:
+            return torch.tensor([]), torch.tensor([]), torch.tensor([])
+        
+        # Concatenate and subsample if needed
+        replay_k = torch.cat(replay_k, dim=0)
+        replay_v = torch.cat(replay_v, dim=0)
+        replay_pos = torch.cat(replay_pos, dim=0)
+        
+        if replay_k.shape[0] > self.config.replay_budget:
+            # Subsample to budget
+            indices = torch.linspace(0, replay_k.shape[0] - 1, self.config.replay_budget, dtype=torch.long, device=replay_k.device)
+            replay_k = replay_k[indices]
+            replay_v = replay_v[indices]
+            replay_pos = replay_pos[indices]
+        
+        self.stats["total_replay_triggers"] += 1
+        self.stats["total_replay_tokens"] += replay_k.shape[0]
+        
+        return replay_k, replay_v, replay_pos
+    
+    def _update_calibration_anchors(self, layer_idx: int, head_idx: int, recent_positions: torch.Tensor):
+        """
+        Update sliding anchor window for position calibration
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            recent_positions: Recent token positions
+        """
+        if not self.config.enable_position_calibration:
+            return
+        
+        key = (layer_idx, head_idx)
+        window_size = self.config.calibration_window
+        
+        # Store recent positions for calibration
+        if key not in self.calibration_anchors:
+            self.calibration_anchors[key] = recent_positions[-window_size:]
+        else:
+            # Concatenate and keep last window_size
+            combined = torch.cat([self.calibration_anchors[key], recent_positions])
+            self.calibration_anchors[key] = combined[-window_size:]
+    
+    def _calibrate_synthetic_positions(self, layer_idx: int, head_idx: int, 
+                                        synthetic_positions: torch.Tensor,
+                                        compressed_keys: torch.Tensor) -> torch.Tensor:
+        """
+        Calibrate synthetic positions using lightweight linear solve
+        
+        Args:
+            layer_idx, head_idx: Head identifier
+            synthetic_positions: Initial synthetic position assignments [num_tokens]
+            compressed_keys: Compressed key vectors [num_tokens, d_k]
+            
+        Returns:
+            Calibrated positions with drift correction
+        """
+        if not self.config.enable_position_calibration:
+            return synthetic_positions
+        
+        if synthetic_positions.numel() == 0 or compressed_keys.shape[0] == 0:
+            return synthetic_positions
+        
+        key = (layer_idx, head_idx)
+        
+        # Need anchor positions for calibration
+        if key not in self.calibration_anchors or self.calibration_anchors[key].numel() < 10:
+            # Not enough anchors yet, return uncalibrated
+            return synthetic_positions
+        
+        try:
+            # Compute expected vs actual position drift
+            anchor_positions = self.calibration_anchors[key]
+            
+            # Simple linear model: offset = a * position + b
+            # Solve least squares to find drift correction
+            
+            # Use recent anchors as ground truth
+            X = anchor_positions.float().unsqueeze(1)  # [n, 1]
+            X = torch.cat([X, torch.ones_like(X)], dim=1)  # [n, 2] with bias term
+            
+            # Target: positions should align with sequence order
+            y = torch.arange(anchor_positions.shape[0], dtype=torch.float32, device=X.device).unsqueeze(1)
+            
+            # Solve: X @ theta = y  =>  theta = (X^T X)^{-1} X^T y
+            XtX = X.T @ X
+            Xty = X.T @ y
+            
+            # Add regularization for stability
+            reg = self.config.calibration_regularization
+            XtX = XtX + reg * torch.eye(2, device=XtX.device)
+            
+            theta = torch.linalg.solve(XtX, Xty)  # [2, 1]
+            
+            # Apply learned offset to synthetic positions
+            synth_X = synthetic_positions.float().unsqueeze(1)
+            synth_X = torch.cat([synth_X, torch.ones_like(synth_X)], dim=1)  # [m, 2]
+            
+            calibrated = (synth_X @ theta).squeeze(1)  # [m]
+            
+            # Store learned offset for tracking
+            self.calibration_offsets[key] = theta
+            
+            # Blend calibrated with original (avoid over-correction)
+            blend = 0.7  # Trust calibration but keep some original structure
+            calibrated = blend * calibrated + (1 - blend) * synthetic_positions.float()
+            
+            # Ensure monotonic and within reasonable range
+            calibrated = calibrated.long()
+            calibrated = torch.clamp(calibrated, 
+                                      min=self.start_size, 
+                                      max=self.current_length - self.recent_size)
+            
+            self.stats["total_calibrations"] += 1
+            
+            return calibrated
+            
+        except Exception as e:
+            # Calibration failed, return original
+            return synthetic_positions
         
     def _anchor_positions(self, original_positions: List[int], num_anchors: int) -> torch.Tensor:
         """
@@ -644,6 +1202,13 @@ class ADMSKVCache:
                         dtype=torch.long,
                     )
 
+                    # Store original tokens in replay bank
+                    self._update_replay_bank(layer_idx, head_idx, middle_k, middle_v, middle_positions)
+                    
+                    # Update calibration anchors with recent positions
+                    recent_positions = torch.arange(recent_start, seq_len, device=recent_k.device, dtype=torch.long)
+                    self._update_calibration_anchors(layer_idx, head_idx, recent_positions)
+
                     # Reserve part of the budget for exact top tokens based on importance
                     topk_k = middle_k[:0]
                     topk_v = middle_v[:0]
@@ -685,6 +1250,12 @@ class ADMSKVCache:
                     comp_k = middle_k[:0]
                     comp_v = middle_v[:0]
                     comp_positions = remaining_positions[:0]
+                    original_k_for_energy = middle_k_for_compress  # Save for energy calculation
+                    
+                    # Initialize replay variables (always, to avoid UnboundLocalError)
+                    replay_k = torch.tensor([], dtype=middle_k.dtype, device=middle_k.device)
+                    replay_v = torch.tensor([], dtype=middle_v.dtype, device=middle_v.device)
+                    replay_pos = torch.tensor([], dtype=middle_positions.dtype, device=middle_positions.device)
 
                     if remaining_budget > 0 and middle_k_for_compress.shape[0] > 0:
                         # Transpose for compressor: [d_k, seq_len]
@@ -696,6 +1267,19 @@ class ADMSKVCache:
 
                         comp_k = comp_k_t.transpose(0, 1)
                         comp_v = comp_v_t.transpose(0, 1)
+                        
+                        # Compute spectral energy for replay triggering
+                        if self.config.enable_residual_replay:
+                            energy_ratio = self._compute_spectral_energy(comp_k, comp_v, middle_k_for_compress, middle_v_for_compress)
+                            replay_k, replay_v, replay_pos = self._trigger_replay(layer_idx, head_idx, energy_ratio)
+                        else:
+                            energy_ratio = 1.0
+                        
+                        # Compute attention mass (approximation using value norms)
+                        attention_mass = torch.norm(middle_v, dim=1).sum().item() / max(1.0, middle_v.numel())
+                        
+                        # Update adaptive controller state
+                        self._update_controller_state(layer_idx, head_idx, energy_ratio, attention_mass)
 
                         if comp_k.shape[0] > remaining_budget:
                             comp_scores = self._importance_scores(comp_k, comp_v, recent_k)
@@ -710,8 +1294,56 @@ class ADMSKVCache:
                             else:
                                 anchor_source = remaining_positions.detach().cpu().tolist()
                                 comp_positions = self._anchor_positions(anchor_source, comp_k.shape[0]).to(comp_k.device)
+                                
+                            # Apply position calibration to compressed positions
+                            if self.config.enable_position_calibration and comp_positions.numel() > 0:
+                                comp_positions = self._calibrate_synthetic_positions(layer_idx, head_idx, comp_positions, comp_k)
+                    
+                    # Handle sketch bank and overflow for dual-fidelity
+                    sketch_k = torch.tensor([])
+                    sketch_v = torch.tensor([])
+                    sketch_positions = torch.tensor([])
+                    promoted_k = torch.tensor([])
+                    promoted_v = torch.tensor([])
+                    promoted_pos = torch.tensor([])
+                    
+                    if self.config.enable_dual_fidelity:
+                        sketch_budget = getattr(self.config, "sketch_budget", 0)
+                        
+                        # Promote high-energy sketches to precision
+                        promotion_count = max(1, sketch_budget // 4) if sketch_budget > 0 else 0
+                        if promotion_count > 0:
+                            promoted_k, promoted_v, promoted_pos = self._promote_sketches_to_precision(
+                                layer_idx, head_idx, promotion_count
+                            )
+                        
+                        # Compute overflow (tokens that didn't make it to precision bank)
+                        total_precision = topk_k.shape[0] + comp_k.shape[0] + promoted_k.shape[0]
+                        if middle_k.shape[0] > total_precision:
+                            # Create overflow from remaining tokens
+                            overflow_mask = torch.ones(middle_k.shape[0], dtype=torch.bool, device=middle_k.device)
+                            if topk_k.shape[0] > 0:
+                                # Mark topk as not overflow
+                                topk_orig_indices = topk_indices if importance_count > 0 else torch.tensor([], dtype=torch.long, device=middle_k.device)
+                                if topk_orig_indices.numel() > 0:
+                                    overflow_mask[topk_orig_indices] = False
+                            
+                            # Collect overflow tokens
+                            overflow_indices = torch.nonzero(overflow_mask, as_tuple=False).squeeze(-1)
+                            if overflow_indices.numel() > sketch_budget * 2:  # Limit overflow storage
+                                overflow_indices = overflow_indices[:sketch_budget * 2]
+                            
+                            if overflow_indices.numel() > 0:
+                                overflow_k = middle_k[overflow_indices]
+                                overflow_v = middle_v[overflow_indices]
+                                overflow_pos = middle_positions[overflow_indices]
+                                self._update_sketch_bank(layer_idx, head_idx, overflow_k, overflow_v, overflow_pos)
+                        
+                        # Get sketch tokens for attention
+                        if sketch_budget > 0:
+                            sketch_k, sketch_v, sketch_positions = self._get_sketch_tokens(layer_idx, head_idx, sketch_budget)
 
-                    # Merge exact and compressed selections and sort by synthetic/original positions
+                    # Merge exact, compressed, promoted, replayed, and sketch tokens
                     components_k = []
                     components_v = []
                     component_positions = []
@@ -720,11 +1352,26 @@ class ADMSKVCache:
                         components_k.append(topk_k)
                         components_v.append(topk_v)
                         component_positions.append(topk_positions)
+                    
+                    if promoted_k.shape[0] > 0:
+                        components_k.append(promoted_k)
+                        components_v.append(promoted_v)
+                        component_positions.append(promoted_pos)
 
                     if comp_k.shape[0] > 0:
                         components_k.append(comp_k)
                         components_v.append(comp_v)
                         component_positions.append(comp_positions.to(comp_k.device))
+                    
+                    if replay_k.shape[0] > 0:
+                        components_k.append(replay_k)
+                        components_v.append(replay_v)
+                        component_positions.append(replay_pos.to(replay_k.device))
+                    
+                    if sketch_k.shape[0] > 0:
+                        components_k.append(sketch_k)
+                        components_v.append(sketch_v)
+                        component_positions.append(sketch_positions.to(sketch_k.device))
 
                     if component_positions:
                         stacked_positions = torch.cat(component_positions)
@@ -738,7 +1385,7 @@ class ADMSKVCache:
                         self.stats["total_compressions"] += 1
                         self.stats["total_exact_kept"] += topk_k.shape[0]
                         self.stats["total_compressed_kept"] += comp_k.shape[0]
-                        self.stats["total_middle_dropped"] += middle_k.shape[0] - topk_k.shape[0] - comp_k.shape[0]
+                        self.stats["total_middle_dropped"] += middle_k.shape[0] - topk_k.shape[0] - comp_k.shape[0] - promoted_k.shape[0] - replay_k.shape[0] - sketch_k.shape[0]
                     else:
                         # If no candidates survived selection, drop middle entirely (StreamingLLM behavior)
                         middle_combined_k = middle_k[:0]
@@ -851,6 +1498,26 @@ class ADMSKVCache:
             expected_max = effective_sink + self.middle_allocation + self.recent_size
             
             print(f"[ADMS Stats @ {seq_len}] Avg per head: exact={avg_exact:.1f}, compressed={avg_comp:.1f}, dropped={avg_dropped:.1f}", flush=True)
+            
+            # ADM++ feature stats
+            if self.config.enable_dual_fidelity:
+                total_sketches = self.stats.get("total_sketch_tokens", 0)
+                total_promotions = self.stats.get("total_sketch_promotions", 0)
+                print(f"[ADMS Dual-Fidelity @ {seq_len}] Sketches: {total_sketches}, Promotions: {total_promotions}", flush=True)
+            
+            if self.config.enable_residual_replay:
+                total_replays = self.stats.get("total_replay_triggers", 0)
+                total_replay_tokens = self.stats.get("total_replay_tokens", 0)
+                print(f"[ADMS Replay @ {seq_len}] Triggers: {total_replays}, Tokens: {total_replay_tokens}", flush=True)
+            
+            if self.config.enable_position_calibration:
+                total_calibrations = self.stats.get("total_calibrations", 0)
+                print(f"[ADMS Calibration @ {seq_len}] Total calibrations: {total_calibrations}", flush=True)
+            
+            if self.config.enable_adaptive_controller:
+                total_adjustments = self.stats.get("total_budget_adjustments", 0)
+                print(f"[ADMS Controller @ {seq_len}] Budget adjustments: {total_adjustments}", flush=True)
+            
             print(f"[ADMS Cache @ {seq_len}] Actual size: {actual_cache_size}, Expected max: {expected_max}, Ratio: {actual_cache_size/seq_len:.2%}", flush=True)
             
             # WARNING if cache is unexpectedly large
